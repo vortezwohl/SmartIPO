@@ -228,6 +228,10 @@ class ConversationTimeline:
         collapsible = bool(payload.get("collapsible", False))
         collapsed = bool(payload.get("collapsed_by_default", False))
         error = str(payload.get("error", "")).strip()
+        raw_error = str(payload.get("raw_error", "")).strip()
+        error_code = str(payload.get("error_code", "")).strip()
+        model_error = str(payload.get("model_error", "")).strip()
+        retry_hint = str(payload.get("retry_hint", "")).strip()
         failure_stage = str(payload.get("failure_stage", "")).strip()
         execution_duration_ms = int(payload.get("duration_ms", 0) or 0)
         metadata = {
@@ -241,6 +245,14 @@ class ConversationTimeline:
             metadata["phase"] = "execution"
         if error:
             metadata["error"] = error
+        if raw_error:
+            metadata["raw_error"] = raw_error
+        if error_code:
+            metadata["error_code"] = error_code
+        if model_error:
+            metadata["model_error"] = model_error
+        if retry_hint:
+            metadata["retry_hint"] = retry_hint
         if failure_stage:
             metadata["failure_stage"] = failure_stage
         if item is None:

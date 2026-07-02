@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from rich.text import Text
@@ -17,44 +16,17 @@ from textual.containers import Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.widgets import Footer, Header, Input, Static
 
-from src.core.agent import Agent
+from src.app.default_agent import (
+    DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_WORKBENCH_TOOL_NAMES,
+    build_default_agent,
+)
 from src.core.events import LoopEvent, TOOL_ACTIVITY_EVENT_TYPES
 from src.core.timeline import ConversationTimeline, TimelineEntry
-from src.service.model_hub import create_default_brain_model
-from src.tool.registry import build_default_tool_registry
-
-
-DEFAULT_SYSTEM_PROMPT = """
-你是 SmartIPO 的本地 coding agent。
-- 接到一个任务后要自己连续规划并调用工具，直到任务自然结束。
-- 优先使用 fileglide 完成读取、搜索、写入、移动等本地文件系统操作。
-- 先做范围尽可能小的只读探索，再进入修改。
-- 先读再改，避免无根据猜测。
-- 工具失败时要直接暴露失败，不要伪装成成功。
-""".strip()
 
 _MIN_TOOL_VISIBLE_MS = 200
 _TIMELINE_REFRESH_INTERVAL_SECONDS = 0.01
 _THINKING_ANIMATION_FRAME_MS = 150
-DEFAULT_WORKBENCH_TOOL_NAMES = (
-    "path.list",
-    "file.list",
-    "text.read",
-    "text.grep",
-)
-
-
-def build_default_agent(event_sink) -> Agent:
-    """构造默认本地主脑控制器。"""
-
-    return Agent(
-        model=create_default_brain_model(),
-        tool_registry=build_default_tool_registry(),
-        system_prompt=DEFAULT_SYSTEM_PROMPT,
-        tool_names=DEFAULT_WORKBENCH_TOOL_NAMES,
-        event_sink=event_sink,
-        workspace_root=os.getcwd(),
-    )
 
 
 class AgentWorkbenchApp(App[None]):

@@ -1,13 +1,23 @@
-"""主脑工具契约定义。
+"""主脑工具契约兼容入口。
 
-该文件提供项目内工具暴露给 strands 运行时所需的最小静态描述、调用上下文
-和事件桥接能力。它仍然保持为薄层，不引入插件系统或权限框架。
+该文件保留项目内最常用的工具上下文对象，并把结构化 `ToolSpec` / `ToolResult`
+等新合同从 `src.tool.framework` 重新导出，保证旧引用路径继续可用。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+from src.tool.framework.contracts import (
+    ToolDoc,
+    ToolError,
+    ToolExecutionError,
+    ToolIdentity,
+    ToolPolicies,
+    ToolResult,
+    ToolSpec,
+)
 
 
 @dataclass(slots=True)
@@ -27,15 +37,7 @@ class ToolContext:
     event_sink: Callable[[Any], None] | None = None
 
     def resolve_service(self, name: str, default: Any = None) -> Any:
-        """按名称读取共享服务对象。
-
-        Args:
-            name: 服务名。
-            default: 未找到时返回的默认值。
-
-        Returns:
-            命中的服务对象或默认值。
-        """
+        """按名称读取共享服务对象。"""
 
         return self.services.get(name, default)
 
@@ -46,37 +48,13 @@ class ToolContext:
             self.event_sink(event)
 
 
-@dataclass(slots=True)
-class ToolResult:
-    """描述一次工具调用的规范化结果。
-
-    Args:
-        content: 原始结果内容。
-        summary: 主脑可直接消费的摘要文本。
-        metadata: 附加元数据。
-    """
-
-    content: Any
-    summary: str = ""
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True, slots=True)
-class ToolSpec:
-    """描述一个可暴露给主脑的业务工具。
-
-    Args:
-        name: 工具名。
-        description: 工具职责说明。
-        display_name: 面向人类的显示名。
-        input_schema: strands tool 输入 schema。
-        handler: 实际执行业务逻辑的处理函数。
-        tool_kind: 工具类别，供 UI 展示使用。
-    """
-
-    name: str
-    description: str
-    display_name: str
-    input_schema: dict[str, Any]
-    handler: Callable[..., ToolResult]
-    tool_kind: str = "native"
+__all__ = [
+    "ToolContext",
+    "ToolDoc",
+    "ToolError",
+    "ToolExecutionError",
+    "ToolIdentity",
+    "ToolPolicies",
+    "ToolResult",
+    "ToolSpec",
+]

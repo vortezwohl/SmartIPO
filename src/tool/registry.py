@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from src.tool.contracts import ToolSpec
+from src.tool.framework.validation import validate_tool_catalog
 
 
 class ToolRegistry:
@@ -39,6 +40,11 @@ class ToolRegistry:
             return list(self._tools.values())
         return [self._tools[name] for name in tool_names if name in self._tools]
 
+    def validate(self) -> None:
+        """校验当前注册表中的全部工具合同。"""
+
+        validate_tool_catalog(self._tools.values())
+
 
 def build_default_tool_registry() -> ToolRegistry:
     """构造默认工具注册表。"""
@@ -50,4 +56,5 @@ def build_default_tool_registry() -> ToolRegistry:
     for tool_spec in build_fileglide_tool_specs():
         registry.register(tool_spec)
     registry.register(TOOL_SPEC)
+    registry.validate()
     return registry

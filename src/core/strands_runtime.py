@@ -8,8 +8,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import json
-import re
 import time
 from typing import Any
 
@@ -18,9 +16,14 @@ from strands.tools import PythonAgentTool
 
 from src.core.events import LoopEventSink, build_loop_event
 from src.tool.contracts import ToolContext, ToolResult, ToolSpec
+from src.tool.framework.execution import (
+    build_tool_result_payload,
+    extract_tool_error,
+    serialize_tool_result,
+)
+from src.tool.framework.validation import sanitize_provider_tool_name
 
 
-_INVALID_PROVIDER_TOOL_NAME = re.compile(r"[^a-zA-Z0-9_-]+")
 _TOOL_DETAIL_COLLAPSE_THRESHOLD = 240
 _TOOL_PREVIEW_LIMIT = 120
 
@@ -343,15 +346,6 @@ def build_tool_context(
     )
 
 
-def sanitize_provider_tool_name(name: str) -> str:
-    """把内部工具名转换为 provider 可接受的名字。"""
-
-    sanitized = _INVALID_PROVIDER_TOOL_NAME.sub("_", name)
-    if not sanitized:
-        raise RuntimeError(f"工具名 '{name}' 无法转换为合法的 provider 工具名。")
-    return sanitized
-
-
 def build_strands_tools(
     *,
     tool_specs: list[ToolSpec],
@@ -429,65 +423,19 @@ def _invoke_agent(
     return StrandsRunResult(text=text)
 
 
-def _serialize_tool_result(result: ToolResult) -> str:
-    """把工具结果整理为主脑可读文本。"""
-
-    model_text = str(result.metadata.get("model_text", "")).strip()
-    if model_text:
-        return model_text
-    if isinstance(result.content, str):
-        return result.content
-    return json.dumps(result.content, ensure_ascii=False, default=str)
-
-
-def _build_tool_result_payload(result: ToolResult) -> dict[str, Any]:
-    """把工具结果整理为时间线可消费的概要与详情。"""
-
-    detail = _serialize_tool_result(result).strip()
-    preview = result.summary.strip() or _truncate_text(detail, _TOOL_PREVIEW_LIMIT)
-    collapsible = (
-        len(detail) > _TOOL_DETAIL_COLLAPSE_THRESHOLD
-        or "\n" in detail
-        or detail != preview
-    )
-    return {
-        "result_preview": preview,
-        "result_detail": detail,
-        "collapsible": collapsible,
-        "collapsed_by_default": collapsible,
-    }
-
-
-def _truncate_text(text: str, limit: int) -> str:
-    """把长文本裁剪为稳定预览。"""
-
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit].rstrip()}..."
-
-
-def _build_tool_model_error(error: Exception) -> str:
-    """提取应回给模型的错误文本。"""
-
-    message = str(error).strip()
-    if message:
-        return message
-    return error.__class__.__name__
-
-
 def _build_tool_event_error_payload(error: Exception) -> dict[str, str]:
     """提取应回给时间线的原始错误诊断。"""
 
-    raw_error = str(getattr(error, "raw_error", "")).strip()
-    if not raw_error:
-        raw_error = _build_tool_model_error(error)
-    payload = {"error": raw_error}
-    error_code = str(getattr(error, "error_code", "")).strip()
-    if error_code:
-        payload["error_code"] = error_code
-    model_error = _build_tool_model_error(error)
-    if model_error != raw_error:
-        payload["model_error"] = model_error
+    tool_error = extract_tool_error(error)
+    payload = {"error": tool_error.raw_error or tool_error.model_message}
+    if tool_error.raw_error:
+        payload["raw_error"] = tool_error.raw_error
+    if tool_error.code:
+        payload["error_code"] = tool_error.code
+    if tool_error.model_message != payload["error"]:
+        payload["model_error"] = tool_error.model_message
+    if tool_error.retry_hint:
+        payload["retry_hint"] = tool_error.retry_hint
     return payload
 
 
@@ -549,7 +497,7 @@ class _ProjectStrandsTool(PythonAgentTool):
         """供测试与假 runtime 直接调用工具。"""
 
         result = self._invoke_project_tool(kwargs, tool_use_id="direct")
-        return _serialize_tool_result(result)
+        return serialize_tool_result(result)
 
     def _run_tool_use(self, tool_use: dict[str, Any], **_invocation_state: Any) -> dict[str, Any]:
         tool_use_id = str(tool_use.get("toolUseId", "unknown")).strip() or "unknown"
@@ -561,13 +509,14 @@ class _ProjectStrandsTool(PythonAgentTool):
         try:
             result = self._invoke_project_tool(tool_input, tool_use_id=tool_use_id)
         except Exception as error:
+            tool_error = extract_tool_error(error)
             return _build_strands_error_result(
                 tool_use_id,
-                _build_tool_model_error(error),
+                tool_error.model_message,
             )
         return _build_strands_success_result(
             tool_use_id,
-            _serialize_tool_result(result),
+            serialize_tool_result(result),
         )
 
     def _invoke_project_tool(self, tool_input: dict[str, Any], *, tool_use_id: str) -> ToolResult:
@@ -614,13 +563,17 @@ class _ProjectStrandsTool(PythonAgentTool):
             self._executed_tools.append(
                 StrandsToolSummary(
                     name=self._project_tool_spec.name,
-                    summary=result.summary,
+                    summary=result.preview_text or result.summary,
                     metadata=result.metadata,
                     duration_ms=duration_ms,
                 )
             )
         if self._event_sink is not None:
-            result_payload = _build_tool_result_payload(result)
+            result_payload = build_tool_result_payload(
+                result,
+                detail_collapse_threshold=_TOOL_DETAIL_COLLAPSE_THRESHOLD,
+                preview_limit=_TOOL_PREVIEW_LIMIT,
+            )
             self._event_sink(
                 build_loop_event(
                     "progress",

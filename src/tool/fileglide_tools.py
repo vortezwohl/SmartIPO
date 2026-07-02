@@ -7,33 +7,36 @@
 from __future__ import annotations
 
 import base64
-from pathlib import Path
 from typing import Any, Callable
 
-from fileglide.exceptions import FileGlideError, NotFoundError, ScopeError
 from fileglide.facade import FileGlideFacade
 
-from src.tool.contracts import ToolContext, ToolResult, ToolSpec
+from src.tool.contracts import ToolContext, ToolDoc, ToolPolicies, ToolResult, ToolSpec
+from src.tool.framework.policies import (
+    FileglideReadonlyErrorMapper,
+    FileglideResultFormatter,
+    ReadonlyTraversalPolicy,
+    ScopedPathPolicy,
+    run_with_error_mapper,
+)
 
 
 _FILEGLIDE_FACADE = FileGlideFacade()
 _MODEL_ENTRY_LIMIT = 80
 _MODEL_LINE_LIMIT = 120
-
-
-class _ReadonlyToolContractError(RuntimeError):
-    """描述只读工具的契约级失败，并保留原始诊断。"""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        raw_error: str,
-        error_code: str,
-    ) -> None:
-        super().__init__(message)
-        self.raw_error = raw_error
-        self.error_code = error_code
+_SCOPED_PATH_POLICY = ScopedPathPolicy()
+_READONLY_TRAVERSAL_POLICY = ReadonlyTraversalPolicy(default_recursive=False)
+_FILEGLIDE_RESULT_FORMATTER = FileglideResultFormatter(
+    model_entry_limit=_MODEL_ENTRY_LIMIT,
+    model_line_limit=_MODEL_LINE_LIMIT,
+)
+_FILEGLIDE_ERROR_MAPPER = FileglideReadonlyErrorMapper()
+_FILEGLIDE_POLICIES = ToolPolicies(
+    path_policy=_SCOPED_PATH_POLICY,
+    traversal_policy=_READONLY_TRAVERSAL_POLICY,
+    result_formatter=_FILEGLIDE_RESULT_FORMATTER,
+    error_mapper=_FILEGLIDE_ERROR_MAPPER,
+)
 
 
 def _default_root(context: ToolContext, root: str | None) -> str:
@@ -45,124 +48,7 @@ def _default_root(context: ToolContext, root: str | None) -> str:
 def _build_result(name: str, payload: dict[str, Any]) -> ToolResult:
     """把 fileglide 返回值整理为统一工具结果。"""
 
-    summary = _build_summary(name, payload)
-    model_text = _build_model_text(payload)
-    metadata = {"tool_name": name}
-    if model_text:
-        metadata["model_text"] = model_text
-    return ToolResult(
-        content=payload,
-        summary=summary,
-        metadata=metadata,
-    )
-
-
-def _build_summary(name: str, payload: dict[str, Any]) -> str:
-    """提取适合时间线预览的简短摘要。"""
-
-    entry = payload.get("entry", {})
-    if isinstance(entry, dict) and entry.get("relative_path"):
-        return str(entry["relative_path"])
-    entries = payload.get("entries")
-    if isinstance(entries, list):
-        return f"{len(entries)} entries"
-    if "query" in payload:
-        return str(payload["query"])
-    if "pattern" in payload:
-        return str(payload["pattern"])
-    return name
-
-
-def _build_model_text(payload: dict[str, Any]) -> str:
-    """把 fileglide payload 整理成模型可直接消费的正文。"""
-
-    lines = payload.get("lines")
-    if isinstance(lines, list) and "entry" in payload and "content" in payload:
-        return _render_text_read_payload(payload)
-    entries = payload.get("entries")
-    if isinstance(entries, list) and "scope" in payload:
-        return _render_entries_payload(payload)
-    return ""
-
-
-def _render_entries_payload(payload: dict[str, Any]) -> str:
-    """渲染目录/文件列举类结果。"""
-
-    scope = payload.get("scope", {})
-    entries = payload.get("entries", [])
-    root = str(scope.get("root", "")).strip()
-    start = str(scope.get("start", "")).strip()
-    lines = [
-        f"Scope root: {root or '.'}",
-        f"Start: {_render_scope_start(root, start)}",
-        f"Entry count: {int(payload.get('count', len(entries)) or 0)}",
-        "Entries:",
-    ]
-    if not entries:
-        lines.append("- [empty]")
-        return "\n".join(lines)
-    for entry in entries[:_MODEL_ENTRY_LIMIT]:
-        relative_path = _normalize_relative_text(
-            str(entry.get("relative_path", "")).strip()
-        )
-        kind = str(entry.get("kind", "path")).strip() or "path"
-        lines.append(f"- {relative_path} [{kind}]")
-    if len(entries) > _MODEL_ENTRY_LIMIT:
-        lines.append(
-            f"- ... {len(entries) - _MODEL_ENTRY_LIMIT} more entries omitted"
-        )
-    return "\n".join(lines)
-
-
-def _render_text_read_payload(payload: dict[str, Any]) -> str:
-    """渲染文本读取结果。"""
-
-    entry = payload.get("entry", {})
-    relative_path = _normalize_relative_text(
-        str(entry.get("relative_path") or entry.get("path") or "").strip()
-    )
-    lines_payload = payload.get("lines", [])
-    rendered = [
-        f"File: {relative_path}",
-        f"Line count: {int(payload.get('line_count', len(lines_payload)) or 0)}",
-        "Content:",
-    ]
-    if not lines_payload:
-        text = str(payload.get("content", "")).rstrip()
-        rendered.append(text or "[empty]")
-        return "\n".join(rendered)
-    for item in lines_payload[:_MODEL_LINE_LIMIT]:
-        line_number = int(item.get("line_number", 0) or 0)
-        line_text = str(item.get("text", ""))
-        rendered.append(f"{line_number}: {line_text}")
-    if len(lines_payload) > _MODEL_LINE_LIMIT:
-        rendered.append(
-            f"... {len(lines_payload) - _MODEL_LINE_LIMIT} more lines omitted"
-        )
-    return "\n".join(rendered)
-
-
-def _render_scope_start(root: str, start: str) -> str:
-    """把 scope start 渲染为更稳定的相对路径。"""
-
-    if not root or not start:
-        return _normalize_relative_text(start)
-    try:
-        relative = Path(start).resolve(strict=False).relative_to(
-            Path(root).resolve(strict=False)
-        )
-    except ValueError:
-        return _normalize_relative_text(start)
-    return _normalize_relative_text(str(relative))
-
-
-def _normalize_relative_text(value: str) -> str:
-    """统一相对路径文本表现。"""
-
-    normalized = value.replace("\\", "/").strip()
-    if normalized in {"", "."}:
-        return "."
-    return normalized
+    return _FILEGLIDE_RESULT_FORMATTER.build_result(name, payload)
 
 
 def _normalize_readonly_scope(
@@ -173,61 +59,11 @@ def _normalize_readonly_scope(
 ) -> tuple[str, str]:
     """把只读工具的绝对路径参数规范化为 root + 相对路径。"""
 
-    explicit_root = kwargs.get("root")
-    raw_value = str(kwargs.get(path_key, ".")).strip()
-    if not raw_value:
-        raw_value = "."
-    normalized_root = _default_root(context, explicit_root)
-    target_path = Path(raw_value)
-    if not target_path.is_absolute():
-        return normalized_root, raw_value
-    resolved_target = target_path.expanduser().resolve(strict=False)
-    if explicit_root is not None:
-        resolved_root = Path(explicit_root).expanduser().resolve(strict=False)
-        try:
-            relative_target = resolved_target.relative_to(resolved_root)
-        except ValueError as error:
-            raise _build_conflicting_root_error(
-                path_key=path_key,
-                resolved_root=resolved_root,
-                resolved_target=resolved_target,
-            ) from error
-        return str(resolved_root), _normalize_relative_text(str(relative_target))
-    anchor = resolved_target.anchor or str(Path("/"))
-    anchor_root = Path(anchor).expanduser().resolve(strict=False)
-    relative_target = resolved_target.relative_to(anchor_root)
-    return str(anchor_root), _normalize_relative_text(str(relative_target))
-
-
-def _build_conflicting_root_error(
-    *,
-    path_key: str,
-    resolved_root: Path,
-    resolved_target: Path,
-) -> _ReadonlyToolContractError:
-    """构造显式 root 与绝对路径冲突时的契约错误。"""
-
-    anchor = Path(resolved_target.anchor or str(Path("/"))).expanduser().resolve(
-        strict=False
-    )
-    relative_target = _normalize_relative_text(
-        str(resolved_target.relative_to(anchor))
-    )
-    suggestion = (
-        f"For example, use root=\"{anchor}\" and {path_key}=\"{relative_target}\"."
-    )
-    raw_error = (
-        f"absolute {path_key} '{resolved_target}' escapes explicit root "
-        f"'{resolved_root}'"
-    )
-    return _ReadonlyToolContractError(
-        (
-            "This call violates the root-relative path contract: "
-            f'explicit root "{resolved_root}" does not contain absolute '
-            f'{path_key} "{resolved_target}". {suggestion}'
-        ),
-        raw_error=raw_error,
-        error_code="root_path_conflict",
+    return _SCOPED_PATH_POLICY.normalize(
+        workspace_root=_default_root(context, kwargs.get("root")),
+        explicit_root=kwargs.get("root"),
+        raw_value=str(kwargs.get(path_key, ".")).strip() or ".",
+        path_key=path_key,
     )
 
 
@@ -239,75 +75,32 @@ def _run_readonly_operation(
     path_value: str,
     runner: Callable[[], dict[str, Any]],
 ) -> ToolResult:
-    """执行只读 fileglide 调用，并在失败时转成模型友好错误。"""
+    """执行只读 fileglide 调用，并通过公共策略映射结果和错误。"""
 
-    try:
-        payload = runner()
-    except Exception as error:
-        raise _wrap_readonly_error(
-            tool_name=tool_name,
-            root=root,
-            path_key=path_key,
-            path_value=path_value,
-            error=error,
-        ) from error
-    return _build_result(tool_name, payload)
+    return run_with_error_mapper(
+        mapper=_FILEGLIDE_ERROR_MAPPER.map,
+        tool_name=tool_name,
+        root=root,
+        path_key=path_key,
+        path_value=path_value,
+        runner=runner,
+        formatter=_FILEGLIDE_RESULT_FORMATTER,
+    )
 
 
-def _wrap_readonly_error(
-    *,
-    tool_name: str,
-    root: str,
-    path_key: str,
-    path_value: str,
-    error: Exception,
-) -> Exception:
-    """把底层异常转换成可恢复的只读工具失败。"""
+def _readonly_recursive(kwargs: dict[str, Any], *, default: bool) -> bool:
+    """读取只读探索工具的统一递归默认值。"""
 
-    if isinstance(error, _ReadonlyToolContractError):
-        return error
-    raw_error = str(error).strip() or error.__class__.__name__
-    if isinstance(error, ScopeError):
-        message = (
-            f"{tool_name} failed because the call violates the root-relative "
-            f'path contract. Set root to the intended scope root and pass '
-            f'{path_key} as a path relative to that root. Current root="{root}", '
-            f'{path_key}="{path_value}".'
+    explicit = kwargs.get("recursive")
+    if explicit is not None:
+        return _READONLY_TRAVERSAL_POLICY.recursive(
+            explicit=bool(explicit),
+            default=default,
         )
-        return _ReadonlyToolContractError(
-            message,
-            raw_error=raw_error,
-            error_code="scope_violation",
-        )
-    if isinstance(error, NotFoundError):
-        message = (
-            f"{tool_name} failed because the requested target does not exist. "
-            f'Confirm that {path_key} exists inside the current root before '
-            f'retrying. Current root="{root}", {path_key}="{path_value}".'
-        )
-        return _ReadonlyToolContractError(
-            message,
-            raw_error=raw_error,
-            error_code="not_found",
-        )
-    if isinstance(error, PermissionError):
-        message = (
-            f"{tool_name} failed because traversal hit a protected location. "
-            f"Retry with a narrower root or {path_key}, or set recursive=false "
-            f"for a shallow exploration pass."
-        )
-        return _ReadonlyToolContractError(
-            message,
-            raw_error=raw_error,
-            error_code="permission_denied",
-        )
-    if isinstance(error, FileGlideError):
-        return _ReadonlyToolContractError(
-            f"{tool_name} failed: {raw_error}",
-            raw_error=raw_error,
-            error_code=getattr(error, "code", "fileglide_error"),
-        )
-    return error
+    return _READONLY_TRAVERSAL_POLICY.recursive(
+        explicit=None,
+        default=default,
+    )
 
 
 def _object_schema(
@@ -326,20 +119,25 @@ def _object_schema(
 def _tool_spec(
     *,
     name: str,
-    description: str,
+    description: ToolDoc | str,
     display_name: str,
     input_schema: dict[str, Any],
     handler: Callable[..., ToolResult],
 ) -> ToolSpec:
     """构造一个 fileglide 工具定义。"""
 
+    normalized_doc = description
+    if isinstance(description, ToolDoc):
+        normalized_doc = _merge_schema_parameter_docs(description, input_schema)
     return ToolSpec(
         name=name,
-        description=description,
+        description=description if isinstance(description, str) else "",
         display_name=display_name,
         input_schema=input_schema,
         handler=handler,
         tool_kind="fileglide",
+        doc=normalized_doc if isinstance(normalized_doc, ToolDoc) else None,
+        policies=_FILEGLIDE_POLICIES,
     )
 
 
@@ -350,22 +148,44 @@ def _tool_description(
     parameters: tuple[str, ...],
     returns: tuple[str, ...],
     common_failures: tuple[str, ...],
-) -> str:
-    """Build a detailed English tool description."""
+) -> ToolDoc:
+    """构造结构化英文工具文档。"""
 
-    sections: list[tuple[str, tuple[str, ...]]] = [
-        ("Purpose", (purpose,)),
-        ("When to use", when_to_use),
-        ("Parameters", parameters),
-        ("Returns", returns),
-        ("Common failures", common_failures),
-    ]
-    lines: list[str] = []
-    for title, bullets in sections:
-        lines.append(f"{title}:")
-        lines.extend(f"- {bullet}" for bullet in bullets)
-        lines.append("")
-    return "\n".join(lines).rstrip()
+    return ToolDoc(
+        purpose=purpose,
+        when_to_use=when_to_use,
+        parameters=parameters,
+        returns=returns,
+        common_failures=common_failures,
+    )
+
+
+def _merge_schema_parameter_docs(doc: ToolDoc, input_schema: dict[str, Any]) -> ToolDoc:
+    """用 schema 字段补齐 fileglide 的参数文档，避免重复手写样板。"""
+
+    properties = input_schema.get("properties", {})
+    if not isinstance(properties, dict):
+        return doc
+    documented_names = {
+        item.split("`")[1]
+        for item in doc.parameters
+        if item.count("`") >= 2
+    }
+    merged_parameters = list(doc.parameters)
+    for field_name in properties:
+        if field_name in documented_names:
+            continue
+        merged_parameters.append(
+            f"`{field_name}`: Additional structured input field supported by this tool."
+        )
+    return ToolDoc(
+        purpose=doc.purpose,
+        when_to_use=doc.when_to_use,
+        parameters=tuple(merged_parameters),
+        returns=doc.returns,
+        common_failures=doc.common_failures,
+        notes=doc.notes,
+    )
 
 
 _ROOT_SCOPE_PARAMETER = (
@@ -486,7 +306,7 @@ def _run_file_list(context: ToolContext, **kwargs) -> ToolResult:
             root,
             start=start,
             kind="file",
-            recursive=kwargs.get("recursive", False),
+            recursive=_readonly_recursive(kwargs, default=False),
             max_depth=kwargs.get("max_depth"),
             include=tuple(kwargs.get("include", [])),
             exclude=tuple(kwargs.get("exclude", [])),
@@ -511,7 +331,7 @@ def _run_file_search(context: ToolContext, **kwargs) -> ToolResult:
             mode=kwargs.get("mode", "contains"),
             start=start,
             kind="file",
-            recursive=kwargs.get("recursive", True),
+            recursive=_readonly_recursive(kwargs, default=True),
             max_depth=kwargs.get("max_depth"),
             include=tuple(kwargs.get("include", [])),
             exclude=tuple(kwargs.get("exclude", [])),
@@ -577,7 +397,7 @@ def _run_path_list(context: ToolContext, **kwargs) -> ToolResult:
             root,
             start=start,
             kind=kwargs.get("kind", "directory"),
-            recursive=kwargs.get("recursive", False),
+            recursive=_readonly_recursive(kwargs, default=False),
             max_depth=kwargs.get("max_depth"),
             include=tuple(kwargs.get("include", [])),
             exclude=tuple(kwargs.get("exclude", [])),
@@ -602,7 +422,7 @@ def _run_path_search(context: ToolContext, **kwargs) -> ToolResult:
             mode=kwargs.get("mode", "contains"),
             start=start,
             kind=kwargs.get("kind", "all"),
-            recursive=kwargs.get("recursive", True),
+            recursive=_readonly_recursive(kwargs, default=True),
             max_depth=kwargs.get("max_depth"),
             include=tuple(kwargs.get("include", [])),
             exclude=tuple(kwargs.get("exclude", [])),
@@ -626,7 +446,7 @@ def _run_tree_list(context: ToolContext, **kwargs) -> ToolResult:
             root,
             start=start,
             kind=kwargs.get("kind", "all"),
-            recursive=kwargs.get("recursive", True),
+            recursive=_readonly_recursive(kwargs, default=True),
             max_depth=kwargs.get("max_depth"),
             include=tuple(kwargs.get("include", [])),
             exclude=tuple(kwargs.get("exclude", [])),
@@ -709,7 +529,7 @@ def _run_text_grep(context: ToolContext, **kwargs) -> ToolResult:
             root,
             pattern=kwargs["pattern"],
             start=start,
-            recursive=kwargs.get("recursive", True),
+            recursive=_readonly_recursive(kwargs, default=True),
             max_depth=kwargs.get("max_depth"),
             include=tuple(kwargs.get("include", [])),
             exclude=tuple(kwargs.get("exclude", [])),

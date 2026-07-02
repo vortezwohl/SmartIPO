@@ -544,8 +544,10 @@ class SessionRuntimeTests(unittest.TestCase):
 
         self.assertEqual(events[-1].event_type, "tool_failed")
         self.assertEqual(events[-1].payload["error"], "Text target does not exist.")
+        self.assertEqual(events[-1].payload["raw_error"], "Text target does not exist.")
         self.assertEqual(events[-1].payload["error_code"], "not_found")
         self.assertIn("does not exist", events[-1].payload["model_error"])
+        self.assertIn("Confirm that target exists", events[-1].payload["retry_hint"])
 
     def test_callback_bridge_emits_attempt_failure_when_tool_never_reaches_local_execution(self) -> None:
         """provider-side tool attempt 若未进入本地执行，应产生 attempt failure 事件。"""

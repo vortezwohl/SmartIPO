@@ -7,7 +7,8 @@
 from __future__ import annotations
 
 from src.ext.seedream import generate_seedream_image
-from src.tool.contracts import ToolContext, ToolResult, ToolSpec
+from src.tool.contracts import ToolContext, ToolDoc, ToolResult, ToolSpec
+from src.tool.framework.execution import build_tool_result
 
 
 def run(
@@ -64,14 +65,18 @@ def run(
         f"Seedream generated {len(result.images)} image item(s) "
         f"with model {result.model}."
     )
-    return ToolResult(
-        content={
+    content = {
             "model": result.model,
             "prompt": result.prompt,
             "images": result.images,
             "response_payload": result.response_payload,
-        },
+        }
+    return build_tool_result(
+        content=content,
         summary=summary,
+        preview_text=summary,
+        model_text=summary,
+        detail_text=summary,
         metadata={
             "model": result.model,
             "image_count": len(result.images),
@@ -80,12 +85,40 @@ def run(
     )
 
 
+_TOOL_DOC = ToolDoc(
+    purpose="Generate new images or image variations with the SmartIPO Seedream backend.",
+    when_to_use=(
+        "You need a newly generated image from a text prompt.",
+        "You need an image variation and the backend supports an optional reference image.",
+    ),
+    parameters=(
+        "`prompt`: Main image generation prompt.",
+        "`image`: Optional reference image as a URL, data URL, or base64 payload.",
+        "`model`: Optional backend model override.",
+        "`size`: Optional output size override.",
+        "`n`: Number of images to generate.",
+        "`seed`: Optional random seed for reproducibility.",
+        "`guidance_scale`: Optional prompt guidance strength.",
+        "`watermark`: Whether to add a watermark.",
+        "`response_format`: Preferred response format. Use `url` or `b64_json`.",
+        "`user`: Optional business user identifier.",
+    ),
+    returns=(
+        "`model`: Model that generated the images.",
+        "`prompt`: Prompt echoed back by the backend.",
+        "`images`: Generated image items returned by the backend.",
+        "`response_payload`: Raw backend response payload for diagnostics.",
+    ),
+    common_failures=(
+        "Backend request failure: the upstream image generation service is unavailable or rejects the request.",
+        "Invalid input: the prompt, reference image, or requested response format is not accepted by the backend.",
+    ),
+)
+
+
 TOOL_SPEC = ToolSpec(
     name="generate_seedream_image",
-    description=(
-        "Generate images with Seedream. Use this when the user wants a new image "
-        "or image variation and you need the SmartIPO image generation backend."
-    ),
+    doc=_TOOL_DOC,
     display_name="Seedream Image",
     input_schema={
         "type": "object",
