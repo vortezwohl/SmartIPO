@@ -57,8 +57,11 @@ class _FakeUiSessionLoop:
                     display_name="Text read",
                     tool_kind="fileglide",
                     duration_ms=12,
-                    result_summary="README.md",
                     message="Text read 调用完成。",
+                    result_preview="README.md",
+                    result_detail="README.md\nline 2\nline 3",
+                    collapsible=True,
+                    collapsed_by_default=True,
                 )
             )
             self.event_sink(
@@ -112,7 +115,28 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("你: 整理 README", text)
         self.assertIn("文件工具 · Text read", text)
+        self.assertIn("概要: README.md", text)
+        self.assertIn("结果: [详细结果已收起]", text)
         self.assertIn("AI: 已完成", text)
+
+    async def test_running_thinking_entry_renders_local_animation(self) -> None:
+        """thinking 条目应以本地动画渲染 `. .. ...`。"""
+
+        app = AgentWorkbenchApp(session_loop=_FakeUiSessionLoop())
+        app._timeline.append_user_message("你好")
+        app._timeline.apply_event(
+            build_loop_event(
+                "progress",
+                "thinking_started",
+                message="正在思考下一步。",
+            )
+        )
+        thinking_entry = app._timeline.entries[-1]
+        thinking_entry.duration_ms = 800
+
+        text = app._render_timeline_text()
+
+        self.assertIn("thinking ...", text)
 
 
 if __name__ == "__main__":

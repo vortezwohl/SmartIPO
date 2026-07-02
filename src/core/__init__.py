@@ -9,6 +9,7 @@ from src.core.events import LoopEvent
 from src.core.llm import LLM
 from src.core.strands_runtime import StrandsRunResult, StrandsRuntime
 from src.core.text2text import Text2Text
+from src.core.timeline import ConversationTimeline, TimelineEntry
 
 __all__ = [
     "Agent",
@@ -18,4 +19,6 @@ __all__ = [
     "StrandsRunResult",
     "StrandsRuntime",
     "Text2Text",
+    "ConversationTimeline",
+    "TimelineEntry",
 ]

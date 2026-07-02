@@ -20,6 +20,8 @@ from src.tool.contracts import ToolContext, ToolResult, ToolSpec
 
 
 _INVALID_PROVIDER_TOOL_NAME = re.compile(r"[^a-zA-Z0-9_-]+")
+_TOOL_DETAIL_COLLAPSE_THRESHOLD = 240
+_TOOL_PREVIEW_LIMIT = 120
 
 
 @dataclass(slots=True)
@@ -375,6 +377,7 @@ def build_strands_tool(
                 )
             )
         if event_sink is not None:
+            result_payload = _build_tool_result_payload(result)
             event_sink(
                 build_loop_event(
                     "progress",
@@ -384,6 +387,10 @@ def build_strands_tool(
                     tool_kind=tool_spec.tool_kind,
                     duration_ms=duration_ms,
                     result_summary=result.summary,
+                    result_preview=result_payload["result_preview"],
+                    result_detail=result_payload["result_detail"],
+                    collapsible=result_payload["collapsible"],
+                    collapsed_by_default=result_payload["collapsed_by_default"],
                     message=f"{tool_spec.display_name} 调用完成。",
                 )
             )
@@ -428,3 +435,29 @@ def _serialize_tool_result(result: ToolResult) -> str:
     if isinstance(result.content, str):
         return result.content
     return json.dumps(result.content, ensure_ascii=False, default=str)
+
+
+def _build_tool_result_payload(result: ToolResult) -> dict[str, Any]:
+    """把工具结果整理为时间线可消费的概要与详情。"""
+
+    detail = _serialize_tool_result(result).strip()
+    preview = result.summary.strip() or _truncate_text(detail, _TOOL_PREVIEW_LIMIT)
+    collapsible = (
+        len(detail) > _TOOL_DETAIL_COLLAPSE_THRESHOLD
+        or "\n" in detail
+        or detail != preview
+    )
+    return {
+        "result_preview": preview,
+        "result_detail": detail,
+        "collapsible": collapsible,
+        "collapsed_by_default": collapsible,
+    }
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    """把长文本裁剪为稳定预览。"""
+
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit].rstrip()}..."
