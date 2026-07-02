@@ -1,7 +1,7 @@
 """主脑工具契约定义。
 
-该文件提供项目内工具暴露给 strands 运行时所需的最小静态描述和调用
-上下文。它刻意保持简单，不引入插件协议、权限系统或多层抽象。
+该文件提供项目内工具暴露给 strands 运行时所需的最小静态描述、调用上下文
+和事件桥接能力。它仍然保持为薄层，不引入插件系统或权限框架。
 """
 
 from __future__ import annotations
@@ -17,10 +17,14 @@ class ToolContext:
     Args:
         services: 共享服务对象字典。
         llm: 可选文本模型调用器。
+        workspace_root: fileglide 等本地工具默认作用域根目录。
+        event_sink: 可选运行时事件接收器。
     """
 
     services: dict[str, Any] = field(default_factory=dict)
     llm: Any | None = None
+    workspace_root: str = "."
+    event_sink: Callable[[Any], None] | None = None
 
     def resolve_service(self, name: str, default: Any = None) -> Any:
         """按名称读取共享服务对象。
@@ -34,6 +38,12 @@ class ToolContext:
         """
 
         return self.services.get(name, default)
+
+    def emit(self, event: Any) -> None:
+        """把运行时事件发送给上层消费者。"""
+
+        if self.event_sink is not None:
+            self.event_sink(event)
 
 
 @dataclass(slots=True)
@@ -61,6 +71,7 @@ class ToolSpec:
         display_name: 面向人类的显示名。
         input_schema: strands tool 输入 schema。
         handler: 实际执行业务逻辑的处理函数。
+        tool_kind: 工具类别，供 UI 展示使用。
     """
 
     name: str
@@ -68,3 +79,4 @@ class ToolSpec:
     display_name: str
     input_schema: dict[str, Any]
     handler: Callable[..., ToolResult]
+    tool_kind: str = "native"

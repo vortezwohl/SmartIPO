@@ -37,4 +37,5 @@ class LLM:
         **kwargs,
     ) -> str:
         """定义统一调用入口，交由子类实现。"""
+        _ = (user_message, system_message, temperature, top_p, seed, kwargs)
         ...

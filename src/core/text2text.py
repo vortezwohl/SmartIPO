@@ -21,7 +21,7 @@ from requests.exceptions import (
 )
 
 from src import NEW_LINE, BLANK
-from src.base.llm import LLM
+from src.core.llm import LLM
 
 logger = logging.getLogger('resume-maker.llm')
 litellm.drop_params = True

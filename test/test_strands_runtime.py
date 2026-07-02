@@ -1,176 +1,281 @@
-"""Strands 最小运行时测试。
+"""本地 agent workbench 运行时测试。
 
-该文件只验证本次 strands agent runtime 集成的最小闭环：主脑模型装配、
-工具成功调用、工具失败边界和工具暴露子集，不依赖真实外部 LLM 请求。
+该文件聚焦验证本次改动的最小闭环：集中模型配置、统一 `Agent` 会话 API、
+多工具事件顺序，以及 fileglide 在本地会话中的真实文件 I/O 能力。
 """
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
-from strands import Agent
-
-from src.base.agent import build_litellm_model
-from src.core.agent_loop import AgentLoop
+from src.core.agent import Agent
+from src.core.events import LoopEvent, build_loop_event
 from src.core.strands_runtime import StrandsRunResult
-from src.ext.seedream import SeedreamImageResult
+from src.model_config import AGENT_SESSION_ROUND, BRAIN_MODEL_CONFIGS, CHANNEL_CONFIGS
+from src.service.model_hub import create_default_brain_model, validate_model_config
 from src.tool.contracts import ToolContext, ToolResult, ToolSpec
 from src.tool.registry import ToolRegistry, build_default_tool_registry
 
 
-class _FakeSuccessRuntime:
-    """用于模拟工具成功调用的 strands runtime。"""
+class _FakeSessionRuntime:
+    """用于验证会话 runner 复用与多工具连续调用。"""
 
     requires_model = False
 
     def __init__(self) -> None:
-        self.seen_tool_names: list[str] = []
+        self.created_runner_count = 0
+        self.prompts: list[str] = []
 
-    def run(self, prompt: str, *, model, tools, system_prompt: str) -> StrandsRunResult:
-        self.seen_tool_names = [item.tool_name for item in tools]
+    def create_session_runner(
+        self,
+        *,
+        model,
+        tools,
+        system_prompt: str,
+        event_sink=None,
+    ):
+        _ = (model, system_prompt)
+        self.created_runner_count += 1
         tool_map = {item.tool_name: item for item in tools}
-        tool_map["generate_seedream_image"](prompt=prompt)
-        return StrandsRunResult(text="image generated")
+        runtime = self
+
+        class _Runner:
+            def run(self, prompt: str) -> StrandsRunResult:
+                runtime.prompts.append(prompt)
+                if event_sink is not None:
+                    event_sink(
+                        build_loop_event(
+                            "progress",
+                            "thinking_started",
+                            message="正在思考下一步。",
+                        )
+                    )
+                tool_map["first_tool"]()
+                tool_map["second_tool"]()
+                if event_sink is not None:
+                    event_sink(
+                        build_loop_event(
+                            "assistant",
+                            "assistant_stream_started",
+                            message="正在生成回复。",
+                        )
+                    )
+                    event_sink(
+                        build_loop_event(
+                            "assistant",
+                            "assistant_stream_delta",
+                            text="done",
+                        )
+                    )
+                    event_sink(
+                        build_loop_event(
+                            "assistant",
+                            "assistant_stream_completed",
+                            text="done",
+                            fallback=False,
+                        )
+                    )
+                return StrandsRunResult(text="done")
+
+        return _Runner()
+
+
+class _FakeFileIoRuntime:
+    """用于验证 fileglide 可在主脑会话中执行真实文件 I/O。"""
+
+    requires_model = False
+
+    def create_session_runner(
+        self,
+        *,
+        model,
+        tools,
+        system_prompt: str,
+        event_sink=None,
+    ):
+        _ = (model, system_prompt, event_sink)
+        tool_map = {item.tool_name: item for item in tools}
+
+        class _Runner:
+            def run(self, prompt: str) -> StrandsRunResult:
+                tool_map["text.write"](target="note.txt", content=prompt)
+                tool_map["text.read"](target="note.txt")
+                return StrandsRunResult(text="file done")
+
+        return _Runner()
 
 
 class _FakeFailureRuntime:
-    """用于模拟工具失败调用的 strands runtime。"""
+    """用于验证工具失败事件不会被伪装成成功。"""
 
     requires_model = False
 
-    def run(self, prompt: str, *, model, tools, system_prompt: str) -> StrandsRunResult:
+    def create_session_runner(
+        self,
+        *,
+        model,
+        tools,
+        system_prompt: str,
+        event_sink=None,
+    ):
+        _ = (model, system_prompt, event_sink)
         tool_map = {item.tool_name: item for item in tools}
-        tool_map["generate_seedream_image"](prompt=prompt)
-        return StrandsRunResult(text="should not reach here")
+
+        class _Runner:
+            def run(self, prompt: str) -> StrandsRunResult:
+                _ = prompt
+                tool_map["broken_tool"]()
+                return StrandsRunResult(text="should not reach")
+
+        return _Runner()
 
 
-class _FakeCaptureRuntime:
-    """用于验证当前回合实际暴露了哪些工具。"""
+class ModelConfigTests(unittest.TestCase):
+    """验证集中模型配置装配与覆写保护。"""
 
-    requires_model = False
+    def test_default_brain_model_comes_from_model_config(self) -> None:
+        """主脑模型必须从 `src/model_config.py` 读取集中配置。"""
 
-    def __init__(self) -> None:
-        self.seen_tool_names: list[str] = []
+        self.assertIn("deepseek", CHANNEL_CONFIGS)
+        self.assertEqual(BRAIN_MODEL_CONFIGS[AGENT_SESSION_ROUND].channel, "deepseek")
 
-    def run(self, prompt: str, *, model, tools, system_prompt: str) -> StrandsRunResult:
-        self.seen_tool_names = [item.tool_name for item in tools]
-        return StrandsRunResult(text="captured")
+        with patch.dict(
+            os.environ,
+            {
+                "API_KEY": "test-key",
+                "API_BASE": "https://example.com/v1",
+            },
+            clear=False,
+        ):
+            validate_model_config()
+            model = create_default_brain_model()
 
-
-class StrandsRuntimeTests(unittest.TestCase):
-    """验证最小 strands runtime 集成。"""
-
-    def test_litellm_model_and_agent_construct(self) -> None:
-        """主脑模型与 Agent 构造应按当前装配方式成功。"""
-
-        model = build_litellm_model(
-            provider="openai",
-            model_name="gpt-4.1-mini",
-            api_key="test-key",
-            api_base="https://example.com/v1",
-            temperature=0.2,
-            top_p=0.8,
-            seed=7,
-        )
-
-        self.assertEqual(model.config["model_id"], "openai/gpt-4.1-mini")
+        self.assertEqual(model.config["model_id"], "openai/deepseek-v4-flash")
         self.assertEqual(model.client_args["api_key"], "test-key")
         self.assertEqual(model.client_args["api_base"], "https://example.com/v1")
         self.assertEqual(model.config["params"]["temperature"], 0.2)
-        self.assertEqual(model.config["params"]["top_p"], 0.8)
-        self.assertEqual(model.config["params"]["seed"], 7)
-        agent = Agent(model=model, tools=[], system_prompt="demo")
-        self.assertIsInstance(agent, Agent)
+        self.assertEqual(model.config["params"]["top_p"], 0.9)
+        self.assertEqual(model.config["params"]["seed"], 42)
 
-    def test_fake_runtime_executes_exposed_tool_and_returns_summary(self) -> None:
-        """已暴露工具应能被 fake runtime 调用并返回统一结果。"""
+    def test_sampling_overrides_are_rejected(self) -> None:
+        """调用点不得直接覆写集中采样参数。"""
 
-        runtime = _FakeSuccessRuntime()
-        loop = AgentLoop(
-            model=None,
-            tool_registry=build_default_tool_registry(),
-            runtime=runtime,
-        )
-        fake_result = SeedreamImageResult(
-            model="demo-model",
-            prompt="draw a skyline",
-            images=[{"url": "https://example.com/demo.png"}],
-            response_payload={"data": [{"url": "https://example.com/demo.png"}]},
-        )
+        with patch.dict(os.environ, {"API_KEY": "test-key"}, clear=False):
+            with self.assertRaisesRegex(RuntimeError, "主脑采样参数必须来自 src/model_config.py"):
+                create_default_brain_model(temperature=0.01)
 
-        with patch(
-            "src.tool.seedream_image.generate_seedream_image",
-            return_value=fake_result,
-        ) as patched:
-            result = loop.run_once(
-                "draw a skyline",
-                system_prompt="You are a helpful image agent.",
+
+class SessionRuntimeTests(unittest.TestCase):
+    """验证会话型运行时、多工具事件与 fileglide 能力。"""
+
+    def test_session_loop_reuses_one_runner_and_records_history(self) -> None:
+        """同一内存会话应复用一个 runner，并允许一轮内连续调用多个工具。"""
+
+        events: list[LoopEvent] = []
+        calls: list[str] = []
+
+        def _make_tool(name: str) -> ToolSpec:
+            def _handler(_context: ToolContext) -> ToolResult:
+                calls.append(name)
+                return ToolResult(content=name, summary=f"{name} ok")
+
+            return ToolSpec(
+                name=name,
+                description=f"{name} description",
+                display_name=name,
+                input_schema={"type": "object", "properties": {}},
+                handler=_handler,
             )
-
-        patched.assert_called_once()
-        self.assertEqual(result.text, "image generated")
-        self.assertEqual(runtime.seen_tool_names, ["generate_seedream_image"])
-        self.assertEqual(len(result.tools), 1)
-        self.assertEqual(result.tools[0].name, "generate_seedream_image")
-        self.assertIn("Seedream generated 1 image item", result.tools[0].summary)
-
-    def test_fake_runtime_tool_failure_bubbles_up(self) -> None:
-        """工具执行失败时异常应继续向上抛出。"""
-
-        loop = AgentLoop(
-            model=None,
-            tool_registry=build_default_tool_registry(),
-            runtime=_FakeFailureRuntime(),
-        )
-
-        with patch(
-            "src.tool.seedream_image.generate_seedream_image",
-            side_effect=RuntimeError("seedream boom"),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "seedream boom"):
-                loop.run_once(
-                    "draw a skyline",
-                    system_prompt="You are a helpful image agent.",
-                )
-
-    def test_only_named_tool_subset_is_exposed(self) -> None:
-        """未显式暴露的工具不应进入当前主脑回合。"""
-
-        hidden_called = {"value": False}
-
-        def _hidden_handler(_context: ToolContext) -> ToolResult:
-            hidden_called["value"] = True
-            return ToolResult(content="hidden", summary="hidden")
 
         registry = ToolRegistry()
-        for tool_spec in build_default_tool_registry().list_tools():
-            registry.register(tool_spec)
-        registry.register(
-            ToolSpec(
-                name="hidden_tool",
-                description="A hidden tool for boundary verification.",
-                display_name="Hidden Tool",
-                input_schema={"type": "object", "properties": {}},
-                handler=_hidden_handler,
-            )
-        )
-        runtime = _FakeCaptureRuntime()
-        loop = AgentLoop(
+        registry.register(_make_tool("first_tool"))
+        registry.register(_make_tool("second_tool"))
+        runtime = _FakeSessionRuntime()
+        agent = Agent(
             model=None,
             tool_registry=registry,
+            system_prompt="You are a test agent.",
             runtime=runtime,
+            event_sink=events.append,
         )
 
-        result = loop.run_once(
-            "draw a skyline",
-            system_prompt="You are a helpful image agent.",
-            tool_names=["generate_seedream_image"],
+        first = agent.run("first job")
+        second = agent.run("second job")
+
+        self.assertEqual(first.text, "done")
+        self.assertEqual(second.text, "done")
+        self.assertEqual(runtime.created_runner_count, 1)
+        self.assertEqual(runtime.prompts, ["first job", "second job"])
+        self.assertEqual(calls, ["first_tool", "second_tool", "first_tool", "second_tool"])
+        self.assertEqual(
+            [event.event_type for event in events[:6]],
+            [
+                "thinking_started",
+                "tool_started",
+                "tool_completed",
+                "tool_started",
+                "tool_completed",
+                "assistant_stream_started",
+            ],
+        )
+        self.assertEqual(len(agent.history), 4)
+        self.assertEqual(agent.history[0].content, "first job")
+        self.assertEqual(agent.history[1].content, "done")
+
+    def test_tool_failure_stays_visible_and_bubbles_up(self) -> None:
+        """工具失败时应产生失败事件并继续向上抛异常。"""
+
+        events: list[LoopEvent] = []
+
+        def _broken_handler(_context: ToolContext) -> ToolResult:
+            raise RuntimeError("broken")
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolSpec(
+                name="broken_tool",
+                description="broken tool",
+                display_name="Broken Tool",
+                input_schema={"type": "object", "properties": {}},
+                handler=_broken_handler,
+            )
+        )
+        agent = Agent(
+            model=None,
+            tool_registry=registry,
+            system_prompt="test",
+            runtime=_FakeFailureRuntime(),
+            event_sink=events.append,
         )
 
-        self.assertEqual(result.text, "captured")
-        self.assertEqual(runtime.seen_tool_names, ["generate_seedream_image"])
-        self.assertFalse(hidden_called["value"])
+        with self.assertRaisesRegex(RuntimeError, "broken"):
+            agent.run("boom")
+
+        self.assertIn("tool_failed", [event.event_type for event in events])
+
+    def test_fileglide_tools_support_real_file_io_without_shell(self) -> None:
+        """本地 agent 会话应能直接通过 fileglide 完成常见文件 I/O。"""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            agent = Agent(
+                model=None,
+                tool_registry=build_default_tool_registry(),
+                system_prompt="Use tools.",
+                runtime=_FakeFileIoRuntime(),
+                tool_names=["text.write", "text.read"],
+                workspace_root=temp_dir,
+            )
+
+            result = agent.run("hello from fileglide")
+
+            self.assertEqual(result.text, "file done")
+            note_path = Path(temp_dir) / "note.txt"
+            self.assertTrue(note_path.exists())
+            self.assertEqual(note_path.read_text(encoding="utf-8"), "hello from fileglide")
 
 
 if __name__ == "__main__":

@@ -1,111 +1,270 @@
-"""Strands 运行时薄桥接层。
+"""Strands 运行时桥接层。
 
-该文件负责把项目内 `ToolSpec` 包成 strands 可调用工具，并把 strands
-的单轮执行结果整理成项目内统一结构，避免业务层直接依赖框架细节。
+该文件负责两件事：
+1. 把项目内 `ToolSpec` 包成 strands 可调用工具；
+2. 把 strands 的流式回调桥接成统一 `LoopEvent`，并提供持久会话 runner。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import time
 from typing import Any
 
-from strands import Agent, tool
+from strands import Agent as StrandsAgent, tool
 
+from src.core.events import LoopEventSink, build_loop_event
 from src.tool.contracts import ToolContext, ToolResult, ToolSpec
 
 
 @dataclass(slots=True)
 class StrandsToolSummary:
-    """描述一条已执行工具的最小摘要。
-
-    Args:
-        name: 工具名。
-        summary: 用户可读摘要。
-        metadata: 工具附加元数据。
-    """
+    """描述一条已执行工具的最小摘要。"""
 
     name: str
     summary: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    duration_ms: int = 0
 
 
 @dataclass(slots=True)
 class StrandsRunResult:
-    """描述一次主脑回合的最小结果。
-
-    Args:
-        text: 模型最终文本回复。
-        tools: 本轮已执行工具摘要列表。
-        error: 运行时主动返回的错误文本。
-    """
+    """描述一次主脑回合的最小结果。"""
 
     text: str = ""
     tools: list[StrandsToolSummary] = field(default_factory=list)
     error: str = ""
 
 
+class _StrandsCallbackBridge:
+    """把 strands callback 事件桥接成统一事件流。"""
+
+    def __init__(self, event_sink: LoopEventSink | None) -> None:
+        self._event_sink = event_sink
+        self.reset()
+
+    def reset(self) -> None:
+        """在每轮调用开始前重置状态。"""
+
+        self._thinking_open = False
+        self._assistant_started = False
+        self._assistant_completed = False
+        self._assistant_text = ""
+
+    def open_thinking(self) -> None:
+        """发出思考开始事件。"""
+
+        if self._event_sink is None or self._thinking_open:
+            return
+        self._thinking_open = True
+        self._event_sink(
+            build_loop_event(
+                "progress",
+                "thinking_started",
+                message="正在思考下一步。",
+            )
+        )
+
+    def complete_thinking(self, message: str = "思考完成。") -> None:
+        """发出思考完成事件。"""
+
+        if self._event_sink is None or not self._thinking_open:
+            return
+        self._thinking_open = False
+        self._event_sink(
+            build_loop_event(
+                "progress",
+                "thinking_completed",
+                message=message,
+            )
+        )
+
+    def fail_thinking(self, message: str) -> None:
+        """发出思考失败事件。"""
+
+        if self._event_sink is None or not self._thinking_open:
+            return
+        self._thinking_open = False
+        self._event_sink(
+            build_loop_event(
+                "progress",
+                "thinking_failed",
+                message=message,
+            )
+        )
+
+    def fail_assistant(self, message: str) -> None:
+        """在已有流式输出时发出 assistant 失败事件。"""
+
+        if (
+            self._event_sink is None
+            or not self._assistant_started
+            or self._assistant_completed
+        ):
+            return
+        self._event_sink(
+            build_loop_event(
+                "assistant",
+                "assistant_stream_failed",
+                message=message,
+            )
+        )
+
+    def flush_result(self, text: str) -> None:
+        """在回调没有完整流出文本时，用最终结果补齐事件。"""
+
+        normalized = text.strip()
+        if self._event_sink is None or not normalized:
+            return
+        is_fallback = not self._assistant_started
+        self.complete_thinking("准备开始回复。")
+        if not self._assistant_started:
+            self._assistant_started = True
+            self._assistant_text = normalized
+            self._event_sink(
+                build_loop_event(
+                    "assistant",
+                    "assistant_stream_started",
+                    message="正在生成回复。",
+                )
+            )
+            self._event_sink(
+                build_loop_event(
+                    "assistant",
+                    "assistant_stream_delta",
+                    text=normalized,
+                )
+            )
+        if not self._assistant_completed:
+            self._assistant_completed = True
+            self._assistant_text = normalized
+            self._event_sink(
+                build_loop_event(
+                    "assistant",
+                    "assistant_stream_completed",
+                    text=self._assistant_text,
+                    fallback=is_fallback,
+                )
+            )
+
+    def __call__(self, **kwargs: Any) -> None:
+        """接收 strands callback_handler 事件。"""
+
+        if self._event_sink is None:
+            return
+        event = kwargs.get("event", {})
+        tool_use = event.get("contentBlockStart", {}).get("start", {}).get("toolUse")
+        if tool_use:
+            self.complete_thinking("已决定调用工具。")
+        data = str(kwargs.get("data", "") or "")
+        if data:
+            self.complete_thinking("准备开始回复。")
+            if not self._assistant_started:
+                self._assistant_started = True
+                self._event_sink(
+                    build_loop_event(
+                        "assistant",
+                        "assistant_stream_started",
+                        message="正在生成回复。",
+                    )
+                )
+            self._assistant_text += data
+            self._event_sink(
+                build_loop_event(
+                    "assistant",
+                    "assistant_stream_delta",
+                    text=data,
+                )
+            )
+            if kwargs.get("complete", False) and not self._assistant_completed:
+                self._assistant_completed = True
+                self._event_sink(
+                    build_loop_event(
+                        "assistant",
+                        "assistant_stream_completed",
+                        text=self._assistant_text,
+                        fallback=False,
+                    )
+                )
+        result = kwargs.get("result")
+        if result is not None and not self._assistant_completed:
+            self.flush_result(str(result))
+
+
+class StrandsSessionRunner:
+    """复用同一个 strands Agent 实例执行多轮会话。"""
+
+    def __init__(
+        self,
+        *,
+        agent_factory: Any,
+        model: Any,
+        tools: list[Any],
+        system_prompt: str,
+        event_sink: LoopEventSink | None,
+    ) -> None:
+        self._event_sink = event_sink
+        self._bridge = _StrandsCallbackBridge(event_sink)
+        self._agent = agent_factory(
+            model=model,
+            tools=tools,
+            system_prompt=system_prompt,
+            callback_handler=self._bridge if event_sink is not None else None,
+        )
+
+    def run(self, prompt: str) -> StrandsRunResult:
+        """执行一轮会话输入。"""
+
+        return _invoke_agent(
+            self._agent,
+            prompt,
+            bridge=self._bridge,
+        )
+
+
 class StrandsRuntime:
-    """执行单轮 strands agent 调用。"""
+    """创建 strands 会话 runner。"""
 
     requires_model = True
 
-    def __init__(self, *, agent_factory: Any = Agent) -> None:
-        """初始化运行时。
-
-        Args:
-            agent_factory: 可注入的 Agent 构造器，便于测试替身接管。
-        """
+    def __init__(self, *, agent_factory: Any = StrandsAgent) -> None:
+        """初始化运行时。"""
 
         self._agent_factory = agent_factory
 
-    def run(
+    def create_session_runner(
         self,
-        prompt: str,
         *,
         model: Any,
         tools: list[Any],
         system_prompt: str,
-    ) -> StrandsRunResult:
-        """执行一轮主脑调用并返回统一结果。
+        event_sink: LoopEventSink | None = None,
+    ) -> StrandsSessionRunner:
+        """创建一个持久会话 runner。"""
 
-        Args:
-            prompt: 本轮用户输入。
-            model: strands 主脑模型。
-            tools: 已包装好的 strands tools。
-            system_prompt: 本轮系统提示词。
-
-        Returns:
-            统一的项目内运行结果。
-        """
-
-        agent = self._agent_factory(
+        return StrandsSessionRunner(
+            agent_factory=self._agent_factory,
             model=model,
             tools=tools,
             system_prompt=system_prompt,
+            event_sink=event_sink,
         )
-        result = agent(prompt)
-        return StrandsRunResult(text=str(result).strip())
-
 
 def build_tool_context(
     *,
     services: dict[str, Any] | None = None,
     llm: Any | None = None,
+    workspace_root: str = ".",
+    event_sink: LoopEventSink | None = None,
 ) -> ToolContext:
-    """构造一份共享给工具调用的最小上下文。
-
-    Args:
-        services: 共享服务对象字典。
-        llm: 可选文本模型调用器。
-
-    Returns:
-        工具处理函数可复用的调用上下文。
-    """
+    """构造一份共享给工具调用的最小上下文。"""
 
     return ToolContext(
         services=services or {},
         llm=llm,
+        workspace_root=workspace_root,
+        event_sink=event_sink,
     )
 
 
@@ -115,31 +274,68 @@ def build_strands_tool(
     services: dict[str, Any] | None = None,
     llm: Any | None = None,
     executed_tools: list[StrandsToolSummary] | None = None,
+    event_sink: LoopEventSink | None = None,
+    workspace_root: str = ".",
 ):
-    """把一个项目内 `ToolSpec` 包装为 strands tool。
-
-    Args:
-        tool_spec: 项目内工具描述。
-        services: 透传给工具上下文的服务对象。
-        llm: 透传给工具上下文的文本模型调用器。
-        executed_tools: 本轮已执行工具摘要收集器。
-
-    Returns:
-        strands 可直接使用的工具对象。
-    """
+    """把一个项目内 `ToolSpec` 包装为 strands tool。"""
 
     def _call(**kwargs):
+        start_time = time.perf_counter()
+        if event_sink is not None:
+            event_sink(
+                build_loop_event(
+                    "progress",
+                    "tool_started",
+                    tool_name=tool_spec.name,
+                    display_name=tool_spec.display_name,
+                    tool_kind=tool_spec.tool_kind,
+                    message=f"开始调用 {tool_spec.display_name}。",
+                )
+            )
         context = build_tool_context(
             services=services,
             llm=llm,
+            workspace_root=workspace_root,
+            event_sink=event_sink,
         )
-        result = tool_spec.handler(context, **kwargs)
+        try:
+            result = tool_spec.handler(context, **kwargs)
+        except Exception as error:
+            duration_ms = int((time.perf_counter() - start_time) * 1000)
+            if event_sink is not None:
+                event_sink(
+                    build_loop_event(
+                        "progress",
+                        "tool_failed",
+                        tool_name=tool_spec.name,
+                        display_name=tool_spec.display_name,
+                        tool_kind=tool_spec.tool_kind,
+                        duration_ms=duration_ms,
+                        message=f"{tool_spec.display_name} 调用失败: {error}",
+                    )
+                )
+            raise
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
         if executed_tools is not None:
             executed_tools.append(
                 StrandsToolSummary(
                     name=tool_spec.name,
                     summary=result.summary,
                     metadata=result.metadata,
+                    duration_ms=duration_ms,
+                )
+            )
+        if event_sink is not None:
+            event_sink(
+                build_loop_event(
+                    "progress",
+                    "tool_completed",
+                    tool_name=tool_spec.name,
+                    display_name=tool_spec.display_name,
+                    tool_kind=tool_spec.tool_kind,
+                    duration_ms=duration_ms,
+                    result_summary=result.summary,
+                    message=f"{tool_spec.display_name} 调用完成。",
                 )
             )
         return _serialize_tool_result(result)
@@ -150,6 +346,29 @@ def build_strands_tool(
         description=tool_spec.description,
         inputSchema=tool_spec.input_schema,
     )
+
+
+def _invoke_agent(
+    agent: Any,
+    prompt: str,
+    *,
+    bridge: _StrandsCallbackBridge,
+) -> StrandsRunResult:
+    """执行一次 Agent 调用并补齐事件状态。"""
+
+    bridge.reset()
+    bridge.open_thinking()
+    try:
+        result = agent(prompt)
+    except Exception as error:
+        message = str(error).strip() or error.__class__.__name__
+        bridge.fail_thinking(message)
+        bridge.fail_assistant(message)
+        raise
+    text = str(result).strip()
+    bridge.flush_result(text)
+    bridge.complete_thinking()
+    return StrandsRunResult(text=text)
 
 
 def _serialize_tool_result(result: ToolResult) -> str:

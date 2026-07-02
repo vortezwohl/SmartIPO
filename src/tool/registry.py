@@ -1,7 +1,7 @@
 """项目内工具注册表。
 
-该文件提供最小内存注册表，并负责装配默认工具集合。第一版只注册
-Seedream 生图工具，后续其他工具按同一模式追加即可。
+该文件提供最小内存注册表，并负责装配默认工具集合。当前默认集合包含
+完整 fileglide 文件系统工具，以及现有 Seedream 生图工具。
 """
 
 from __future__ import annotations
@@ -43,8 +43,11 @@ class ToolRegistry:
 def build_default_tool_registry() -> ToolRegistry:
     """构造默认工具注册表。"""
 
+    from src.tool.fileglide_tools import build_fileglide_tool_specs
     from src.tool.seedream_image import TOOL_SPEC
 
     registry = ToolRegistry()
+    for tool_spec in build_fileglide_tool_specs():
+        registry.register(tool_spec)
     registry.register(TOOL_SPEC)
     return registry
