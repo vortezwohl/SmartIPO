@@ -18,7 +18,7 @@ from textual.css.query import NoMatches
 from textual.widgets import Footer, Header, Input, Static
 
 from src.core.agent import Agent
-from src.core.events import LoopEvent
+from src.core.events import LoopEvent, TOOL_ACTIVITY_EVENT_TYPES
 from src.core.timeline import ConversationTimeline, TimelineEntry
 from src.service.model_hub import create_default_brain_model
 from src.tool.registry import build_default_tool_registry
@@ -33,6 +33,12 @@ DEFAULT_SYSTEM_PROMPT = """
 """.strip()
 
 _MIN_TOOL_VISIBLE_MS = 200
+DEFAULT_WORKBENCH_TOOL_NAMES = (
+    "path.list",
+    "file.list",
+    "text.read",
+    "text.grep",
+)
 
 
 def build_default_agent(event_sink) -> Agent:
@@ -42,6 +48,7 @@ def build_default_agent(event_sink) -> Agent:
         model=create_default_brain_model(),
         tool_registry=build_default_tool_registry(),
         system_prompt=DEFAULT_SYSTEM_PROMPT,
+        tool_names=DEFAULT_WORKBENCH_TOOL_NAMES,
         event_sink=event_sink,
         workspace_root=os.getcwd(),
     )
@@ -190,7 +197,7 @@ class AgentWorkbenchApp(App[None]):
             self._status_message = str(payload.get("message", "思考失败。"))
             self._refresh_view()
             return
-        if channel == "progress" and event_type in {"tool_started", "tool_completed", "tool_failed"}:
+        if channel == "progress" and event_type in TOOL_ACTIVITY_EVENT_TYPES:
             self._status_message = self._format_tool_status(event_type, payload)
             self._refresh_view()
 
@@ -260,6 +267,9 @@ class AgentWorkbenchApp(App[None]):
             f"{self._format_duration(item.duration_ms)}]"
         )
         lines = [header]
+        phase = self._format_tool_phase(item)
+        if phase:
+            lines.append(f"阶段: {phase}")
         error = str(item.metadata.get("error", "")).strip()
         if error:
             lines.append(f"错误: {error}")
@@ -361,11 +371,26 @@ class AgentWorkbenchApp(App[None]):
         """基于原始语义字段生成顶部状态文案。"""
 
         tool_name = str(payload.get("tool_name", "tool")).strip() or "tool"
+        if event_type == "tool_attempt_started":
+            return f"尝试工具: {tool_name}"
         if event_type == "tool_started":
             return f"调用工具: {tool_name}"
+        if event_type == "tool_attempt_failed":
+            return f"工具尝试失败: {tool_name}"
         if event_type == "tool_failed":
             return f"工具失败: {tool_name}"
         return f"工具完成: {tool_name}"
+
+    @staticmethod
+    def _format_tool_phase(item: TimelineEntry) -> str:
+        """渲染工具当前阶段。"""
+
+        phase = str(item.metadata.get("phase", "")).strip()
+        if phase == "attempt":
+            return "调用尝试"
+        if phase == "execution":
+            return "本地执行"
+        return ""
 
     @staticmethod
     def _should_follow_scroll(scroll_widget: VerticalScroll) -> bool:

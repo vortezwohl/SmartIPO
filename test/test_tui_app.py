@@ -13,7 +13,7 @@ from textual.widgets import Input
 from src.core.agent import SessionTurn
 from src.core.events import build_loop_event
 from src.core.strands_runtime import StrandsRunResult
-from src.tui.app import AgentWorkbenchApp
+from src.tui.app import AgentWorkbenchApp, DEFAULT_WORKBENCH_TOOL_NAMES
 
 
 class _BaseUiSessionLoop:
@@ -41,6 +41,7 @@ class _BaseUiSessionLoop:
                 "tool_completed",
                 tool_name="text.read",
                 tool_kind="fileglide",
+                tool_use_id="tool-1",
                 duration_ms=12,
                 result_preview="README.md",
                 result_detail="README.md\nline 2\nline 3",
@@ -94,9 +95,19 @@ class _FakeUiSessionLoop(_BaseUiSessionLoop):
             self.event_sink(
                 build_loop_event(
                     "progress",
+                    "tool_attempt_started",
+                    tool_name="text.read",
+                    tool_kind="fileglide",
+                    tool_use_id="tool-1",
+                )
+            )
+            self.event_sink(
+                build_loop_event(
+                    "progress",
                     "tool_started",
                     tool_name="text.read",
                     tool_kind="fileglide",
+                    tool_use_id="tool-1",
                 )
             )
             self._emit_tool_completed()
@@ -114,9 +125,19 @@ class _SlowToolSessionLoop(_BaseUiSessionLoop):
             self.event_sink(
                 build_loop_event(
                     "progress",
+                    "tool_attempt_started",
+                    tool_name="text.read",
+                    tool_kind="fileglide",
+                    tool_use_id="tool-1",
+                )
+            )
+            self.event_sink(
+                build_loop_event(
+                    "progress",
                     "tool_started",
                     tool_name="text.read",
                     tool_kind="fileglide",
+                    tool_use_id="tool-1",
                 )
             )
             time.sleep(0.35)
@@ -134,14 +155,54 @@ class _FastToolSessionLoop(_BaseUiSessionLoop):
             self.event_sink(
                 build_loop_event(
                     "progress",
+                    "tool_attempt_started",
+                    tool_name="text.read",
+                    tool_kind="fileglide",
+                    tool_use_id="tool-1",
+                )
+            )
+            self.event_sink(
+                build_loop_event(
+                    "progress",
                     "tool_started",
                     tool_name="text.read",
                     tool_kind="fileglide",
+                    tool_use_id="tool-1",
                 )
             )
             self._emit_tool_completed()
         self._history.append(SessionTurn(role="assistant", content="已完成"))
         return StrandsRunResult(text="已完成")
+
+
+class _AttemptFailureSessionLoop(_BaseUiSessionLoop):
+    """用于验证 provider-side tool attempt failure 可见性的假 Agent。"""
+
+    def run(self, prompt: str) -> StrandsRunResult:
+        self._history.append(SessionTurn(role="user", content=prompt))
+        if self.event_sink is not None:
+            self.event_sink(
+                build_loop_event(
+                    "progress",
+                    "tool_attempt_started",
+                    tool_name="path.list",
+                    tool_kind="fileglide",
+                    tool_use_id="tool-attempt-1",
+                )
+            )
+            self.event_sink(
+                build_loop_event(
+                    "progress",
+                    "tool_attempt_failed",
+                    tool_name="path.list",
+                    tool_kind="fileglide",
+                    tool_use_id="tool-attempt-1",
+                    error="provider-side tool call did not reach local execution",
+                    failure_stage="attempt",
+                )
+            )
+        self._history.append(SessionTurn(role="assistant", content="未能完成"))
+        return StrandsRunResult(text="未能完成")
 
 
 class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
@@ -190,6 +251,14 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         text = app._render_timeline_text()
 
         self.assertIn("thinking ...", text)
+
+    def test_default_workbench_tool_set_is_minimal_and_read_only(self) -> None:
+        """默认 workbench 只暴露最小高频只读工具集合。"""
+
+        self.assertEqual(
+            DEFAULT_WORKBENCH_TOOL_NAMES,
+            ("path.list", "file.list", "text.read", "text.grep"),
+        )
 
     async def test_running_tool_entry_and_timer_are_visible_before_completion(self) -> None:
         """工具运行中时，时间线里应先看到运行态和计时。"""
@@ -243,6 +312,33 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("进行中", running_text)
         self.assertIn("完成", done_text)
         self.assertIn("概要: README.md", done_text)
+
+    async def test_provider_side_tool_attempt_failure_is_visible(self) -> None:
+        """provider-side tool attempt failure 也应出现在时间线中。"""
+
+        session_loop = _AttemptFailureSessionLoop()
+        app = AgentWorkbenchApp(session_loop=session_loop)
+        session_loop.event_sink = app._dispatch_runtime_event
+
+        async with app.run_test() as pilot:
+            input_widget = app.query_one("#chat-input", Input)
+            input_widget.value = "看看目录"
+            fake_event = type(
+                "FakeSubmittedEvent",
+                (),
+                {"input": input_widget, "value": "看看目录"},
+            )()
+            app.on_input_submitted(fake_event)
+            await pilot.pause(0.10)
+            text = app._render_timeline_text()
+
+        self.assertIn("path.list [fileglide]", text)
+        self.assertIn("阶段: 调用尝试", text)
+        self.assertIn("失败", text)
+        self.assertIn(
+            "错误: provider-side tool call did not reach local execution",
+            text,
+        )
 
 
 if __name__ == "__main__":

@@ -13,7 +13,8 @@ import re
 import time
 from typing import Any
 
-from strands import Agent as StrandsAgent, tool
+from strands import Agent as StrandsAgent
+from strands.tools import PythonAgentTool
 
 from src.core.events import LoopEventSink, build_loop_event
 from src.tool.contracts import ToolContext, ToolResult, ToolSpec
@@ -46,8 +47,13 @@ class StrandsRunResult:
 class _StrandsCallbackBridge:
     """把 strands callback 事件桥接成统一事件流。"""
 
-    def __init__(self, event_sink: LoopEventSink | None) -> None:
+    def __init__(
+        self,
+        event_sink: LoopEventSink | None,
+        provider_tool_identities: dict[str, tuple[str, str]],
+    ) -> None:
         self._event_sink = event_sink
+        self._provider_tool_identities = provider_tool_identities
         self.reset()
 
     def reset(self) -> None:
@@ -57,6 +63,7 @@ class _StrandsCallbackBridge:
         self._assistant_started = False
         self._assistant_completed = False
         self._assistant_text = ""
+        self._pending_tool_attempts: dict[str, dict[str, str]] = {}
 
     def open_thinking(self) -> None:
         """发出思考开始事件。"""
@@ -103,6 +110,7 @@ class _StrandsCallbackBridge:
     def fail_assistant(self, message: str) -> None:
         """在已有流式输出时发出 assistant 失败事件。"""
 
+        self._fail_pending_tool_attempts(message)
         if (
             self._event_sink is None
             or not self._assistant_started
@@ -123,6 +131,9 @@ class _StrandsCallbackBridge:
         normalized = text.strip()
         if self._event_sink is None or not normalized:
             return
+        self._fail_pending_tool_attempts(
+            "provider-side tool call did not reach local execution",
+        )
         is_fallback = not self._assistant_started
         self.complete_thinking("准备开始回复。")
         if not self._assistant_started:
@@ -162,9 +173,13 @@ class _StrandsCallbackBridge:
         event = kwargs.get("event", {})
         tool_use = event.get("contentBlockStart", {}).get("start", {}).get("toolUse")
         if tool_use:
-            self.complete_thinking("已决定调用工具。")
+            self.complete_thinking()
+            self._record_tool_attempt(tool_use)
         data = str(kwargs.get("data", "") or "")
         if data:
+            self._fail_pending_tool_attempts(
+                "provider-side tool call did not reach local execution",
+            )
             self.complete_thinking("准备开始回复。")
             if not self._assistant_started:
                 self._assistant_started = True
@@ -197,6 +212,51 @@ class _StrandsCallbackBridge:
         if result is not None and not self._assistant_completed:
             self.flush_result(str(result))
 
+    def mark_tool_execution(self, tool_use_id: str) -> None:
+        """标记某次工具尝试已经进入本地执行。"""
+
+        self._pending_tool_attempts.pop(tool_use_id, None)
+
+    def _record_tool_attempt(self, tool_use: dict[str, Any]) -> None:
+        if self._event_sink is None:
+            return
+        provider_tool_name = str(tool_use.get("name", "")).strip()
+        tool_use_id = str(tool_use.get("toolUseId", provider_tool_name)).strip()
+        tool_name, tool_kind = self._provider_tool_identities.get(
+            provider_tool_name,
+            (provider_tool_name or "tool", ""),
+        )
+        self._pending_tool_attempts[tool_use_id] = {
+            "tool_name": tool_name,
+            "tool_kind": tool_kind,
+        }
+        self._event_sink(
+            build_loop_event(
+                "progress",
+                "tool_attempt_started",
+                tool_name=tool_name,
+                tool_kind=tool_kind,
+                tool_use_id=tool_use_id,
+            )
+        )
+
+    def _fail_pending_tool_attempts(self, message: str) -> None:
+        if self._event_sink is None or not self._pending_tool_attempts:
+            return
+        for tool_use_id, identity in tuple(self._pending_tool_attempts.items()):
+            self._event_sink(
+                build_loop_event(
+                    "progress",
+                    "tool_attempt_failed",
+                    tool_name=identity["tool_name"],
+                    tool_kind=identity["tool_kind"],
+                    tool_use_id=tool_use_id,
+                    error=message,
+                    failure_stage="attempt",
+                )
+            )
+        self._pending_tool_attempts.clear()
+
 
 class StrandsSessionRunner:
     """复用同一个 strands Agent 实例执行多轮会话。"""
@@ -211,7 +271,15 @@ class StrandsSessionRunner:
         event_sink: LoopEventSink | None,
     ) -> None:
         self._event_sink = event_sink
-        self._bridge = _StrandsCallbackBridge(event_sink)
+        provider_tool_identities = _build_provider_tool_identities(tools)
+        self._bridge = _StrandsCallbackBridge(
+            event_sink,
+            provider_tool_identities,
+        )
+        for item in tools:
+            setter = getattr(item, "set_bridge", None)
+            if callable(setter):
+                setter(self._bridge)
         self._agent = agent_factory(
             model=model,
             tools=tools,
@@ -328,73 +396,13 @@ def build_strands_tool(
     workspace_root: str = ".",
 ):
     """把一个项目内 `ToolSpec` 包装为 strands tool。"""
-    provider_tool_name = sanitize_provider_tool_name(tool_spec.name)
-
-    def _call(**kwargs):
-        start_time = time.perf_counter()
-        if event_sink is not None:
-            event_sink(
-                build_loop_event(
-                    "progress",
-                    "tool_started",
-                    tool_name=tool_spec.name,
-                    tool_kind=tool_spec.tool_kind,
-                )
-            )
-        context = build_tool_context(
-            services=services,
-            llm=llm,
-            workspace_root=workspace_root,
-            event_sink=event_sink,
-        )
-        try:
-            result = tool_spec.handler(context, **kwargs)
-        except Exception as error:
-            duration_ms = int((time.perf_counter() - start_time) * 1000)
-            if event_sink is not None:
-                event_sink(
-                    build_loop_event(
-                        "progress",
-                        "tool_failed",
-                        tool_name=tool_spec.name,
-                        tool_kind=tool_spec.tool_kind,
-                        duration_ms=duration_ms,
-                        error=str(error),
-                    )
-                )
-            raise
-        duration_ms = int((time.perf_counter() - start_time) * 1000)
-        if executed_tools is not None:
-            executed_tools.append(
-                StrandsToolSummary(
-                    name=tool_spec.name,
-                    summary=result.summary,
-                    metadata=result.metadata,
-                    duration_ms=duration_ms,
-                )
-            )
-        if event_sink is not None:
-            result_payload = _build_tool_result_payload(result)
-            event_sink(
-                build_loop_event(
-                    "progress",
-                    "tool_completed",
-                    tool_name=tool_spec.name,
-                    tool_kind=tool_spec.tool_kind,
-                    duration_ms=duration_ms,
-                    result_preview=result_payload["result_preview"],
-                    result_detail=result_payload["result_detail"],
-                    collapsible=result_payload["collapsible"],
-                    collapsed_by_default=result_payload["collapsed_by_default"],
-                )
-            )
-        return _serialize_tool_result(result)
-
-    return tool(
-        _call,
-        name=provider_tool_name,
-        description=tool_spec.description,
-        inputSchema=tool_spec.input_schema,
+    return _ProjectStrandsTool(
+        tool_spec=tool_spec,
+        services=services,
+        llm=llm,
+        executed_tools=executed_tools,
+        event_sink=event_sink,
+        workspace_root=workspace_root,
     )
 
 
@@ -455,3 +463,195 @@ def _truncate_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit].rstrip()}..."
+
+
+class _ProjectStrandsTool(PythonAgentTool):
+    """把项目内 `ToolSpec` 直接桥接为 Strands 可执行工具。"""
+
+    def __init__(
+        self,
+        *,
+        tool_spec: ToolSpec,
+        services: dict[str, Any] | None,
+        llm: Any | None,
+        executed_tools: list[StrandsToolSummary] | None,
+        event_sink: LoopEventSink | None,
+        workspace_root: str,
+    ) -> None:
+        self._project_tool_spec = tool_spec
+        self._services = services
+        self._llm = llm
+        self._executed_tools = executed_tools
+        self._event_sink = event_sink
+        self._workspace_root = workspace_root
+        self._bridge: _StrandsCallbackBridge | None = None
+        provider_tool_name = sanitize_provider_tool_name(tool_spec.name)
+        super().__init__(
+            provider_tool_name,
+            {
+                "name": provider_tool_name,
+                "description": tool_spec.description,
+                "inputSchema": tool_spec.input_schema,
+            },
+            self._run_tool_use,
+        )
+
+    @property
+    def internal_tool_name(self) -> str:
+        """返回项目内原始工具名。"""
+
+        return self._project_tool_spec.name
+
+    @property
+    def provider_tool_name(self) -> str:
+        """返回 provider 可见工具名。"""
+
+        return self.tool_name
+
+    @property
+    def tool_kind(self) -> str:
+        """返回工具类别。"""
+
+        return self._project_tool_spec.tool_kind
+
+    def set_bridge(self, bridge: _StrandsCallbackBridge) -> None:
+        """绑定会话级 callback bridge。"""
+
+        self._bridge = bridge
+
+    def __call__(self, **kwargs: Any) -> str:
+        """供测试与假 runtime 直接调用工具。"""
+
+        result = self._invoke_project_tool(kwargs, tool_use_id="direct")
+        return _serialize_tool_result(result)
+
+    def _run_tool_use(self, tool_use: dict[str, Any], **_invocation_state: Any) -> dict[str, Any]:
+        tool_use_id = str(tool_use.get("toolUseId", "unknown")).strip() or "unknown"
+        tool_input = tool_use.get("input", {})
+        if not isinstance(tool_input, dict):
+            error = f"tool input must be an object, got {type(tool_input).__name__}"
+            self._emit_attempt_failure(tool_use_id, error)
+            return _build_strands_error_result(tool_use_id, error)
+        try:
+            result = self._invoke_project_tool(tool_input, tool_use_id=tool_use_id)
+        except Exception as error:
+            return _build_strands_error_result(tool_use_id, str(error))
+        return _build_strands_success_result(
+            tool_use_id,
+            _serialize_tool_result(result),
+        )
+
+    def _invoke_project_tool(self, tool_input: dict[str, Any], *, tool_use_id: str) -> ToolResult:
+        if self._bridge is not None and tool_use_id != "direct":
+            self._bridge.mark_tool_execution(tool_use_id)
+        start_time = time.perf_counter()
+        if self._event_sink is not None:
+            self._event_sink(
+                build_loop_event(
+                    "progress",
+                    "tool_started",
+                    tool_name=self._project_tool_spec.name,
+                    tool_kind=self._project_tool_spec.tool_kind,
+                    tool_use_id=tool_use_id,
+                )
+            )
+        context = build_tool_context(
+            services=self._services,
+            llm=self._llm,
+            workspace_root=self._workspace_root,
+            event_sink=self._event_sink,
+        )
+        try:
+            result = self._project_tool_spec.handler(context, **tool_input)
+        except Exception as error:
+            duration_ms = int((time.perf_counter() - start_time) * 1000)
+            if self._event_sink is not None:
+                self._event_sink(
+                    build_loop_event(
+                        "progress",
+                        "tool_failed",
+                        tool_name=self._project_tool_spec.name,
+                        tool_kind=self._project_tool_spec.tool_kind,
+                        tool_use_id=tool_use_id,
+                        duration_ms=duration_ms,
+                        error=str(error),
+                        failure_stage="execution",
+                    )
+                )
+            raise
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        if self._executed_tools is not None:
+            self._executed_tools.append(
+                StrandsToolSummary(
+                    name=self._project_tool_spec.name,
+                    summary=result.summary,
+                    metadata=result.metadata,
+                    duration_ms=duration_ms,
+                )
+            )
+        if self._event_sink is not None:
+            result_payload = _build_tool_result_payload(result)
+            self._event_sink(
+                build_loop_event(
+                    "progress",
+                    "tool_completed",
+                    tool_name=self._project_tool_spec.name,
+                    tool_kind=self._project_tool_spec.tool_kind,
+                    tool_use_id=tool_use_id,
+                    duration_ms=duration_ms,
+                    result_preview=result_payload["result_preview"],
+                    result_detail=result_payload["result_detail"],
+                    collapsible=result_payload["collapsible"],
+                    collapsed_by_default=result_payload["collapsed_by_default"],
+                )
+            )
+        return result
+
+    def _emit_attempt_failure(self, tool_use_id: str, error: str) -> None:
+        if self._event_sink is None:
+            return
+        self._event_sink(
+            build_loop_event(
+                "progress",
+                "tool_attempt_failed",
+                tool_name=self._project_tool_spec.name,
+                tool_kind=self._project_tool_spec.tool_kind,
+                tool_use_id=tool_use_id,
+                error=error,
+                failure_stage="attempt",
+            )
+        )
+
+
+def _build_provider_tool_identities(tools: list[Any]) -> dict[str, tuple[str, str]]:
+    """收集 provider 工具名到内部工具身份的映射。"""
+
+    identities: dict[str, tuple[str, str]] = {}
+    for item in tools:
+        provider_tool_name = getattr(item, "provider_tool_name", None)
+        internal_tool_name = getattr(item, "internal_tool_name", None)
+        tool_kind = getattr(item, "tool_kind", "")
+        if not isinstance(provider_tool_name, str) or not isinstance(internal_tool_name, str):
+            continue
+        identities[provider_tool_name] = (internal_tool_name, str(tool_kind))
+    return identities
+
+
+def _build_strands_success_result(tool_use_id: str, text: str) -> dict[str, Any]:
+    """构造一条 Strands 成功工具结果。"""
+
+    return {
+        "toolUseId": tool_use_id,
+        "status": "success",
+        "content": [{"text": text}],
+    }
+
+
+def _build_strands_error_result(tool_use_id: str, error: str) -> dict[str, Any]:
+    """构造一条 Strands 失败工具结果。"""
+
+    return {
+        "toolUseId": tool_use_id,
+        "status": "error",
+        "content": [{"text": error}],
+    }

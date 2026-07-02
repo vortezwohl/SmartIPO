@@ -11,6 +11,21 @@ from datetime import datetime
 from typing import Any, Callable
 
 
+TOOL_ACTIVITY_EVENT_TYPES = (
+    "tool_attempt_started",
+    "tool_attempt_failed",
+    "tool_started",
+    "tool_completed",
+    "tool_failed",
+)
+
+TOOL_TERMINAL_EVENT_TYPES = (
+    "tool_attempt_failed",
+    "tool_completed",
+    "tool_failed",
+)
+
+
 @dataclass(slots=True)
 class LoopEvent:
     """描述一条可被 UI 消费的运行时事件。"""

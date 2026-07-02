@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from src.core.events import LoopEvent
+from src.core.events import LoopEvent, TOOL_ACTIVITY_EVENT_TYPES
 
 
 @dataclass(slots=True)
@@ -91,7 +91,7 @@ class ConversationTimeline:
         if event_type == "thinking_failed":
             self._fail_thinking(str(payload.get("message", "thinking failed")))
             return
-        if event_type in {"tool_started", "tool_completed", "tool_failed"}:
+        if event_type in TOOL_ACTIVITY_EVENT_TYPES:
             self._apply_tool_event(event_type, payload, event.created_at)
 
     def refresh_running_durations(self, now: datetime | None = None) -> bool:
@@ -174,8 +174,9 @@ class ConversationTimeline:
     ) -> None:
         tool_name = str(payload.get("tool_name", "tool"))
         tool_kind = str(payload.get("tool_kind", "")).strip()
-        item = self._get_entry(self._running_tool_keys.get(tool_name, ""))
-        if event_type == "tool_started":
+        tool_use_id = str(payload.get("tool_use_id", tool_name)).strip() or tool_name
+        item = self._get_entry(self._running_tool_keys.get(tool_use_id, ""))
+        if event_type == "tool_attempt_started":
             self._remove_thinking()
             key = self._append_entry(
                 kind="tool",
@@ -186,21 +187,60 @@ class ConversationTimeline:
                 metadata={
                     "tool_name": tool_name,
                     "tool_kind": tool_kind,
+                    "tool_use_id": tool_use_id,
+                    "phase": "attempt",
                 },
             )
-            self._running_tool_keys[tool_name] = key
+            self._running_tool_keys[tool_use_id] = key
+            return
+        if event_type == "tool_started":
+            if item is None:
+                key = self._append_entry(
+                    kind="tool",
+                    title="",
+                    body="",
+                    status="running",
+                    started_at=created_at,
+                    metadata={
+                        "tool_name": tool_name,
+                        "tool_kind": tool_kind,
+                        "tool_use_id": tool_use_id,
+                        "phase": "execution",
+                    },
+                )
+                self._running_tool_keys[tool_use_id] = key
+                return
+            item.started_at = created_at
+            item.duration_ms = 0
+            item.status = "running"
+            item.metadata.update(
+                {
+                    "tool_name": tool_name,
+                    "tool_kind": tool_kind,
+                    "tool_use_id": tool_use_id,
+                    "phase": "execution",
+                }
+            )
             return
         preview = str(payload.get("result_preview", "")).strip()
         detail = str(payload.get("result_detail", "")).strip()
         collapsible = bool(payload.get("collapsible", False))
         collapsed = bool(payload.get("collapsed_by_default", False))
         error = str(payload.get("error", "")).strip()
+        failure_stage = str(payload.get("failure_stage", "")).strip()
         metadata = {
             "tool_name": tool_name,
             "tool_kind": tool_kind,
+            "tool_use_id": tool_use_id,
         }
+        if event_type == "tool_attempt_failed":
+            metadata["phase"] = "attempt"
+        elif event_type in {"tool_completed", "tool_failed"}:
+            metadata["phase"] = "execution"
         if error:
             metadata["error"] = error
+        if failure_stage:
+            metadata["failure_stage"] = failure_stage
         if item is None:
             self._append_entry(
                 kind="tool",
@@ -214,7 +254,7 @@ class ConversationTimeline:
                 duration_ms=int(payload.get("duration_ms", 0) or 0),
                 metadata=metadata,
             )
-            self._running_tool_keys.pop(tool_name, None)
+            self._running_tool_keys.pop(tool_use_id, None)
             return
         item.preview = preview or item.preview
         item.detail = detail or item.detail
@@ -227,7 +267,7 @@ class ConversationTimeline:
         )
         item.started_at = None
         item.metadata.update(metadata)
-        self._running_tool_keys.pop(tool_name, None)
+        self._running_tool_keys.pop(tool_use_id, None)
 
     def _append_entry(
         self,

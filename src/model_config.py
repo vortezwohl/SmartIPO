@@ -47,9 +47,9 @@ CHANNEL_CONFIGS: dict[str, ChannelConfig] = {
 BRAIN_MODEL_CONFIGS: dict[str, BrainModelConfig] = {
     AGENT_SESSION_ROUND: BrainModelConfig(
         channel="deepseek",
-        model="deepseek-v4-flash",
-        temperature=0.2,
-        top_p=0.9,
-        seed=42,
+        model="deepseek-v4-pro",
+        temperature=.01,
+        top_p=.01,
+        seed=None,
     ),
 }
