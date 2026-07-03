@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from easyharness import Agent, ModelConfig
 from easyharness.toolset import build_fileglide_tools
 
-from src.tool.seedream_image import SEEDREAM_IMAGE_TOOL
+from src.tool import FMP_TOOL_NAMES, build_fmp_tools
 
 load_dotenv()
 
@@ -27,6 +27,7 @@ DEFAULT_SYSTEM_PROMPT = """
 你是 SmartIPO 的本地 coding agent。
 - 接到任务后要按可验证的小步骤推进，直到任务自然结束或明确遇到阻塞。
 - 使用 EasyHarness 提供的 fileglide 工具完成本地文件读取、搜索、编辑、移动和检查。
+- FMP 工具只用于美股 IPO、财报、估值和研究数据查询，不要把它当成通用搜索替代品。
 - 文件修改前先读取必要上下文，避免无根据猜测。
 - 工具失败时直接暴露失败原因，不要伪装成成功。
 - 默认使用中文简体回答用户；工具合同和底层事件语义由 EasyHarness 负责。
@@ -43,7 +44,7 @@ DEFAULT_FILEGLIDE_TOOL_NAMES = (
 )
 
 DEFAULT_BUSINESS_TOOL_NAMES = (
-    "generate_seedream_image",
+    *FMP_TOOL_NAMES,
 )
 
 DEFAULT_WORKBENCH_TOOL_NAMES = (
@@ -88,7 +89,7 @@ def build_default_tools(workspace_root: str | None = None) -> list[object]:
     root = workspace_root or os.getcwd()
     return [
         *build_fileglide_tools(default_root=root),
-        SEEDREAM_IMAGE_TOOL,
+        *build_fmp_tools(),
     ]
 
 

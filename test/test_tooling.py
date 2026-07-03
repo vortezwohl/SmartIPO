@@ -1,7 +1,7 @@
 """EasyHarness 工具与默认装配测试。
 
 该文件验证 SmartIPO 默认工具集合已经切换为 EasyHarness 公共工具合同：
-官方 fileglide toolset 提供文件能力，Seedream 业务工具使用 `@tool` 声明。
+官方 fileglide toolset 提供文件能力，FMP 业务工具使用 `easyharness.tool` 声明。
 """
 
 from __future__ import annotations
@@ -9,8 +9,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from easyharness import Agent, ModelConfig, ToolOutput
-
+from easyharness import Agent, ModelConfig
 from src.agent import (
     DEFAULT_BUSINESS_TOOL_NAMES,
     DEFAULT_FILEGLIDE_TOOL_NAMES,
@@ -20,7 +19,7 @@ from src.agent import (
     build_default_agent,
     build_default_tools,
 )
-from src.tool.seedream_image import SEEDREAM_IMAGE_TOOL
+from src.tool.fmp_tools import FMP_TOOL_NAMES
 
 
 class EasyHarnessToolingTests(unittest.TestCase):
@@ -31,7 +30,8 @@ class EasyHarnessToolingTests(unittest.TestCase):
 
         self.assertIn("fileglide_read_text", DEFAULT_FILEGLIDE_TOOL_NAMES)
         self.assertIn("fileglide_edit_text", DEFAULT_FILEGLIDE_TOOL_NAMES)
-        self.assertIn("generate_seedream_image", DEFAULT_BUSINESS_TOOL_NAMES)
+        self.assertIn("fmp_get_profile", DEFAULT_BUSINESS_TOOL_NAMES)
+        self.assertEqual(len(FMP_TOOL_NAMES), 38)
         self.assertEqual(
             DEFAULT_WORKBENCH_TOOL_NAMES,
             (*DEFAULT_FILEGLIDE_TOOL_NAMES, *DEFAULT_BUSINESS_TOOL_NAMES),
@@ -47,7 +47,7 @@ class EasyHarnessToolingTests(unittest.TestCase):
 
         self.assertIn("fileglide_read_text", names)
         self.assertIn("fileglide_search_text", names)
-        self.assertIn("generate_seedream_image", names)
+        self.assertIn("fmp_get_profile", names)
 
     def test_build_default_agent_returns_easyharness_agent(self) -> None:
         """默认 agent 装配入口应直接返回 EasyHarness Agent。"""
@@ -77,32 +77,6 @@ class EasyHarnessToolingTests(unittest.TestCase):
         self.assertEqual(model.temperature, 0.01)
         self.assertEqual(model.top_p, 0.01)
         self.assertIsNone(model.seed)
-
-    def test_seedream_tool_returns_tool_output(self) -> None:
-        """Seedream 业务工具应返回 EasyHarness ToolOutput。"""
-
-        fake_result = type(
-            "FakeSeedreamResult",
-            (),
-            {
-                "model": "seedream-test",
-                "prompt": "画一只猫",
-                "images": [{"url": "https://example.com/cat.png"}],
-                "response_payload": {"ok": True},
-            },
-        )()
-
-        with patch(
-            "src.tool.seedream_image.generate_seedream_image",
-            return_value=fake_result,
-        ):
-            output = SEEDREAM_IMAGE_TOOL(prompt="画一只猫")
-
-        self.assertIsInstance(output, ToolOutput)
-        self.assertEqual(output.data["model"], "seedream-test")
-        self.assertEqual(output.data["image_count"], 1)
-        self.assertIn("Seedream generated 1 image item", output.preview)
-
 
 if __name__ == "__main__":
     unittest.main()
