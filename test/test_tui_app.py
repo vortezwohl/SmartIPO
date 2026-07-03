@@ -184,7 +184,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
                 {"input": input_widget, "value": "整理 README"},
             )()
             app.on_input_submitted(fake_event)
-            await pilot.pause(0.35)
+            await pilot.pause(0.5)
             text = app._render_timeline_text()
 
         self.assertEqual(agent.prompts, ["整理 README"])
@@ -267,7 +267,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
                 AgentEvent(kind="assistant", status="delta", text="收到"),
                 AgentEvent(kind="assistant", status="completed", text="收到"),
             ],
-            delay_seconds=0.15,
+            delay_seconds=0.3,
         )
         app = AgentWorkbenchApp(agent=agent)
 
@@ -279,7 +279,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
                 {"input": input_widget, "value": "你好"},
             )()
             app.on_input_submitted(fake_event)
-            await pilot.pause(0.05)
+            await pilot.pause(0.02)
             waiting_text = app._render_timeline_text()
             await pilot.pause(0.35)
             final_text = app._render_timeline_text()
@@ -477,20 +477,107 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(thinking_items[0].metadata.get("provisional", False))
         self.assertTrue(thinking_items[0].metadata.get("ephemeral", False))
 
-    def test_non_assistant_event_keeps_local_placeholder_visible(self) -> None:
+    def test_tool_event_removes_waiting_only_placeholder(self) -> None:
         """在 assistant 真正输出前，非 assistant 事件不应移除本地 thinking。"""
 
         app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
         app._start_local_thinking()
-        thinking_item = app._items[-1]
 
         time.sleep(0.02)
         app._apply_agent_event(_started_event("tool", name="fileglide_read_text"))
 
-        self.assertEqual(thinking_item.status, "started")
-        self.assertIsNotNone(thinking_item.started_at)
-        self.assertIn(thinking_item, app._items)
-        self.assertIn("0.00s · { Tool fileglide_read_text · Running }", app._render_timeline_text())
+        text = app._render_timeline_text()
+
+        self.assertNotIn("Thinking ...", text)
+        self.assertIn("{ Tool fileglide_read_text · Running }", text)
+
+    def test_runtime_thinking_text_becomes_visible_history(self) -> None:
+        """收到真实 thinking 文本后，应通过 assistant 表面保留为可见历史。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        app._start_local_thinking()
+
+        app._apply_agent_event(_started_event("thinking"))
+        app._apply_agent_event(
+            AgentEvent(kind="thinking", status="delta", text="Reviewing the filing.")
+        )
+        app._apply_agent_event(
+            AgentEvent(
+                kind="thinking",
+                status="completed",
+                text="Reviewing the filing.",
+            )
+        )
+
+        thinking_item = [item for item in app._items if item.kind == "thinking"][-1]
+        text = app._render_timeline_text()
+
+        self.assertIn("Assistant > Reviewing the filing.", text)
+        self.assertNotIn("Thinking ...", text)
+        self.assertFalse(thinking_item.metadata.get("ephemeral", True))
+        self.assertEqual(thinking_item.body, "Reviewing the filing.")
+
+    def test_assistant_reply_appends_after_visible_thinking_history(self) -> None:
+        """只有真实 thinking 和 assistant 时，最终回复也应作为后续阶段追加。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+
+        app._apply_agent_event(_started_event("thinking"))
+        app._apply_agent_event(
+            AgentEvent(kind="thinking", status="delta", text="Planning the answer.")
+        )
+        app._apply_agent_event(_started_event("assistant"))
+        app._apply_agent_event(
+            AgentEvent(kind="assistant", status="completed", text="Final answer.")
+        )
+
+        text = app._render_timeline_text()
+        thinking_index = text.index("Assistant > Planning the answer.")
+        assistant_index = text.index("Assistant > Final answer.")
+
+        self.assertLess(thinking_index, assistant_index)
+
+    def test_thinking_tool_assistant_chronology_preserves_thinking_history(self) -> None:
+        """真实 thinking 历史在 tool 和最终 assistant 之后仍应可见。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+
+        app._apply_agent_event(_started_event("thinking"))
+        app._apply_agent_event(
+            AgentEvent(kind="thinking", status="delta", text="Inspecting the filing.")
+        )
+        app._apply_agent_event(
+            AgentEvent(
+                kind="tool",
+                status="started",
+                name="fileglide_read_text",
+                data={"tool_use_id": "tool-1"},
+            )
+        )
+        app._apply_agent_event(
+            AgentEvent(
+                kind="tool",
+                status="completed",
+                name="fileglide_read_text",
+                duration_ms=12,
+                data={
+                    "tool_use_id": "tool-1",
+                    "output": {"preview": "fileglide_read_text: prospectus.md"},
+                },
+            )
+        )
+        app._apply_agent_event(_started_event("assistant"))
+        app._apply_agent_event(
+            AgentEvent(kind="assistant", status="completed", text="Done reviewing.")
+        )
+
+        text = app._render_timeline_text()
+        thinking_index = text.index("Assistant > Inspecting the filing.")
+        tool_index = text.index("Tool fileglide_read_text")
+        assistant_index = text.index("Assistant > Done reviewing.")
+
+        self.assertLess(thinking_index, tool_index)
+        self.assertLess(tool_index, assistant_index)
 
     def test_new_session_resets_agent_and_local_state(self) -> None:
         """新会话应同时重置 agent 和 TUI 本地展示态。"""

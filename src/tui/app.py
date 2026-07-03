@@ -292,28 +292,52 @@ class AgentWorkbenchApp(App[None]):
                 )
                 return
             item.status = "started"
-            item.body = ""
             item.metadata["provisional"] = False
             item.metadata["ephemeral"] = True
             return
         item = self._get_active_thinking_item()
         if item is None:
+            key = self._append_item(
+                kind="thinking",
+                title="thinking",
+                body="",
+                status="started",
+                started_at=self._parse_started_at(event.started_at),
+                metadata={"provisional": False, "ephemeral": True},
+            )
+            self._active_by_kind["thinking"] = key
+            item = self._get_item(key)
+        if item is None:
             return
+        thinking_text = (event.text or "").strip()
         if event.status == "delta":
-            item.body = ""
+            item.status = "delta"
             item.metadata["provisional"] = False
-            item.metadata["ephemeral"] = True
+            if thinking_text:
+                self._promote_thinking_item_to_history(
+                    item,
+                    thinking_text,
+                    append=True,
+                )
+            else:
+                item.metadata["ephemeral"] = True
             return
         if event.status in {"completed", "failed", "cancelled"}:
             self._sync_running_item_duration(item)
+            if thinking_text:
+                self._promote_thinking_item_to_history(
+                    item,
+                    thinking_text,
+                    append=False,
+                )
             item.status = event.status
             item.duration_ms = max(item.duration_ms, event.duration_ms or 0)
             item.started_at = None
             item.metadata["provisional"] = False
-            item.metadata["ephemeral"] = True
             self._active_by_kind.pop("thinking", None)
 
     def _apply_tool_event(self, event: AgentEvent) -> None:
+        self._remove_waiting_thinking_items()
         tool_key = self._tool_event_key(event)
         if event.status == "started":
             self._active_tools[tool_key] = self._append_item(
@@ -370,7 +394,7 @@ class AgentWorkbenchApp(App[None]):
 
     def _apply_assistant_event(self, event: AgentEvent) -> None:
         if event.status in {"started", "delta", "completed", "cancelled"}:
-            self._remove_ephemeral_thinking_items()
+            self._remove_waiting_thinking_items()
         if event.status == "started":
             self._active_by_kind["assistant"] = self._append_item(
                 kind="assistant",
@@ -440,7 +464,7 @@ class AgentWorkbenchApp(App[None]):
             return
         if self._is_cancelled_turn(turn_id):
             self._settle_running_turn_items("cancelled")
-            self._remove_thinking_items()
+            self._remove_waiting_thinking_items()
             self._turn_count += 1
             self._finish_active_turn(
                 queue_state="interrupted",
@@ -448,7 +472,7 @@ class AgentWorkbenchApp(App[None]):
             )
             return
         self._settle_running_turn_items("completed")
-        self._remove_thinking_items()
+        self._remove_waiting_thinking_items()
         self._turn_count += 1
         self._finish_active_turn(queue_state="completed", status_message="Reply complete.")
 
@@ -458,7 +482,7 @@ class AgentWorkbenchApp(App[None]):
         if not self._is_active_turn(turn_id):
             return
         self._settle_running_turn_items("failed", message=message)
-        self._remove_thinking_items()
+        self._remove_waiting_thinking_items()
         self._append_item(
             kind="system",
             title="SmartIPO",
@@ -500,21 +524,35 @@ class AgentWorkbenchApp(App[None]):
             metadata={"provisional": True, "ephemeral": True},
         )
 
-    def _remove_ephemeral_thinking_items(self) -> None:
-        """在 assistant 真正开始输出后移除临时 thinking 展示项。"""
+    def _promote_thinking_item_to_history(
+        self,
+        item: _TimelineItem,
+        text: str,
+        *,
+        append: bool,
+    ) -> None:
+        """把收到真实文本的 thinking 条目升级为可保留历史。"""
 
-        self._active_by_kind.pop("thinking", None)
+        item.title = "Assistant > "
+        item.body = self._merge_thinking_text(
+            item.body,
+            text,
+            append=append,
+        )
+        item.metadata["ephemeral"] = False
+        item.metadata["provisional"] = False
+
+    def _remove_waiting_thinking_items(self) -> None:
+        """只移除仍然停留在 waiting-only 状态的 thinking 占位。"""
+
+        active_item = self._get_active_thinking_item()
+        if active_item is not None and self._is_waiting_thinking_item(active_item):
+            self._active_by_kind.pop("thinking", None)
         self._items = [
             item
             for item in self._items
-            if not (item.kind == "thinking" and item.metadata.get("ephemeral", False))
+            if not self._is_waiting_thinking_item(item)
         ]
-
-    def _remove_thinking_items(self) -> None:
-        """在一轮结束或异常收口时移除所有 thinking 展示项。"""
-
-        self._active_by_kind.pop("thinking", None)
-        self._items = [item for item in self._items if item.kind != "thinking"]
 
     def _enqueue_turn(self, prompt: str) -> None:
         """把一条用户提交加入本地执行队列。"""
@@ -750,7 +788,7 @@ class AgentWorkbenchApp(App[None]):
             return
         self._cancel_active_worker()
         self._interrupt_running_turn_items()
-        self._remove_thinking_items()
+        self._remove_waiting_thinking_items()
         self._append_system_message("Interrupted the active reply.")
         self._turn_count += 1
         self._finish_active_turn(
@@ -920,8 +958,11 @@ class AgentWorkbenchApp(App[None]):
             item
             for item in self._items
             if not (
-                item.kind == "user"
-                and str(item.metadata.get("queue_state", "")).strip() == "queued"
+                (
+                    item.kind == "user"
+                    and str(item.metadata.get("queue_state", "")).strip() == "queued"
+                )
+                or self._should_hide_timeline_item(item)
             )
         ]
 
@@ -953,6 +994,8 @@ class AgentWorkbenchApp(App[None]):
         if item.kind in {"system", "compress"}:
             return self._render_system_message_renderable(item)
         if item.kind == "thinking":
+            if not self._is_waiting_thinking_item(item):
+                return self._render_chat_message_renderable(item)
             return self._render_thinking_item_renderable(item)
         if item.kind == "tool":
             return self._render_tool_item_renderable(item)
@@ -1013,6 +1056,8 @@ class AgentWorkbenchApp(App[None]):
         if item.kind in {"user", "assistant", "system", "compress"}:
             return self._format_message_item(item)
         if item.kind == "thinking":
+            if not self._is_waiting_thinking_item(item):
+                return self._format_assistant_item(item)
             return f"{self._format_duration(item.duration_ms)} · Thinking ..."
         return self._format_tool_item(item)
 
@@ -1145,6 +1190,42 @@ class AgentWorkbenchApp(App[None]):
         if not lines:
             return cleaned
         return lines[-1]
+
+    @staticmethod
+    def _merge_thinking_text(existing: str, incoming: str, *, append: bool) -> str:
+        """合并流式 thinking 文本，兼容 delta 追加与 completed 全量回传。"""
+
+        normalized_existing = str(existing)
+        normalized_incoming = str(incoming)
+        if not normalized_incoming:
+            return normalized_existing
+        if not normalized_existing:
+            return normalized_incoming
+        if append:
+            return normalized_existing + normalized_incoming
+        if normalized_incoming == normalized_existing:
+            return normalized_existing
+        if normalized_incoming.startswith(normalized_existing):
+            return normalized_incoming
+        if normalized_existing.endswith(normalized_incoming):
+            return normalized_existing
+        return normalized_existing + normalized_incoming
+
+    @staticmethod
+    def _is_waiting_thinking_item(item: _TimelineItem) -> bool:
+        """判断 thinking 条目是否仍是可删除的 waiting-only 占位。"""
+
+        return item.kind == "thinking" and item.metadata.get("ephemeral", False)
+
+    @staticmethod
+    def _should_hide_timeline_item(item: _TimelineItem) -> bool:
+        """隐藏已经收口但仍未升级为真实历史的空 waiting 占位。"""
+
+        return (
+            AgentWorkbenchApp._is_waiting_thinking_item(item)
+            and item.started_at is None
+            and not item.body.strip()
+        )
 
     @staticmethod
     def _format_event_status(event: AgentEvent) -> str:
