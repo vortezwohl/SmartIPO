@@ -30,6 +30,8 @@ from src.agent import build_default_agent
 
 _TIMELINE_REFRESH_INTERVAL_SECONDS = 0.05
 _CHAT_PREFIX_STYLE = "bold #d8ffe0"
+_THINKING_HISTORY_PREFIX_STYLE = "bold #91ab97"
+_THINKING_HISTORY_BODY_STYLE = "#b2bbb3"
 _TIMING_STYLE = "#7e9b84"
 _THINKING_STYLE = "bold #88ad8f"
 _LOW_EMPHASIS_STYLE = _THINKING_STYLE
@@ -288,12 +290,13 @@ class AgentWorkbenchApp(App[None]):
                     body="",
                     status="started",
                     started_at=self._parse_started_at(event.started_at),
-                    metadata={"ephemeral": True},
+                    metadata={"ephemeral": True, "history": False},
                 )
                 return
             item.status = "started"
             item.metadata["provisional"] = False
             item.metadata["ephemeral"] = True
+            item.metadata["history"] = False
             return
         item = self._get_active_thinking_item()
         if item is None:
@@ -303,7 +306,7 @@ class AgentWorkbenchApp(App[None]):
                 body="",
                 status="started",
                 started_at=self._parse_started_at(event.started_at),
-                metadata={"provisional": False, "ephemeral": True},
+                metadata={"provisional": False, "ephemeral": True, "history": False},
             )
             self._active_by_kind["thinking"] = key
             item = self._get_item(key)
@@ -321,6 +324,7 @@ class AgentWorkbenchApp(App[None]):
                 )
             else:
                 item.metadata["ephemeral"] = True
+                item.metadata["history"] = False
             return
         if event.status in {"completed", "failed", "cancelled"}:
             self._sync_running_item_duration(item)
@@ -533,13 +537,14 @@ class AgentWorkbenchApp(App[None]):
     ) -> None:
         """把收到真实文本的 thinking 条目升级为可保留历史。"""
 
-        item.title = "Assistant > "
+        item.title = "Assistant (Thinking) > "
         item.body = self._merge_thinking_text(
             item.body,
             text,
             append=append,
         )
         item.metadata["ephemeral"] = False
+        item.metadata["history"] = True
         item.metadata["provisional"] = False
 
     def _remove_waiting_thinking_items(self) -> None:
@@ -994,8 +999,8 @@ class AgentWorkbenchApp(App[None]):
         if item.kind in {"system", "compress"}:
             return self._render_system_message_renderable(item)
         if item.kind == "thinking":
-            if not self._is_waiting_thinking_item(item):
-                return self._render_chat_message_renderable(item)
+            if self._is_thinking_history_item(item):
+                return self._render_thinking_history_renderable(item)
             return self._render_thinking_item_renderable(item)
         if item.kind == "tool":
             return self._render_tool_item_renderable(item)
@@ -1008,6 +1013,15 @@ class AgentWorkbenchApp(App[None]):
         message = Text()
         message.append(item.title, style=_CHAT_PREFIX_STYLE)
         message.append(item.body, style="white")
+        return message
+
+    @staticmethod
+    def _render_thinking_history_renderable(item: _TimelineItem) -> Text:
+        """渲染已经升级为真实历史的 thinking 消息。"""
+
+        message = Text()
+        message.append(item.title, style=_THINKING_HISTORY_PREFIX_STYLE)
+        message.append(item.body, style=_THINKING_HISTORY_BODY_STYLE)
         return message
 
     @staticmethod
@@ -1216,6 +1230,12 @@ class AgentWorkbenchApp(App[None]):
         """判断 thinking 条目是否仍是可删除的 waiting-only 占位。"""
 
         return item.kind == "thinking" and item.metadata.get("ephemeral", False)
+
+    @staticmethod
+    def _is_thinking_history_item(item: _TimelineItem) -> bool:
+        """判断 thinking 条目是否已经升级为真实历史消息。"""
+
+        return item.kind == "thinking" and item.metadata.get("history", False)
 
     @staticmethod
     def _should_hide_timeline_item(item: _TimelineItem) -> bool:

@@ -12,10 +12,16 @@ from datetime import datetime, timezone
 
 from easyharness import AgentEvent
 from rich.panel import Panel
+from rich.text import Text
 from textual.containers import VerticalScroll
 from textual.widgets import Input, Static
 
-from src.tui.app import AgentWorkbenchApp
+from src.tui.app import (
+    AgentWorkbenchApp,
+    _CHAT_PREFIX_STYLE,
+    _THINKING_HISTORY_BODY_STYLE,
+    _THINKING_HISTORY_PREFIX_STYLE,
+)
 
 
 class _FakeStreamingAgent:
@@ -512,9 +518,10 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         thinking_item = [item for item in app._items if item.kind == "thinking"][-1]
         text = app._render_timeline_text()
 
-        self.assertIn("Assistant > Reviewing the filing.", text)
+        self.assertIn("Assistant (Thinking) > Reviewing the filing.", text)
         self.assertNotIn("Thinking ...", text)
         self.assertFalse(thinking_item.metadata.get("ephemeral", True))
+        self.assertTrue(thinking_item.metadata.get("history", False))
         self.assertEqual(thinking_item.body, "Reviewing the filing.")
 
     def test_assistant_reply_appends_after_visible_thinking_history(self) -> None:
@@ -532,10 +539,53 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         text = app._render_timeline_text()
-        thinking_index = text.index("Assistant > Planning the answer.")
+        thinking_index = text.index("Assistant (Thinking) > Planning the answer.")
         assistant_index = text.index("Assistant > Final answer.")
 
         self.assertLess(thinking_index, assistant_index)
+
+    def test_thinking_history_renderable_uses_darker_styles(self) -> None:
+        """真实 thinking 历史应使用专属暗色前缀和正文样式。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        app._apply_agent_event(_started_event("thinking"))
+        app._apply_agent_event(
+            AgentEvent(kind="thinking", status="delta", text="Reviewing the filing.")
+        )
+
+        history_item = [item for item in app._items if item.kind == "thinking"][-1]
+        assistant_key = app._append_item(
+            kind="assistant",
+            title="Assistant > ",
+            body="Final answer.",
+        )
+        assistant_item = app._get_item(assistant_key)
+
+        self.assertIsNotNone(assistant_item)
+        history_renderable = app._render_timeline_item_renderable(history_item)
+        assistant_renderable = app._render_timeline_item_renderable(assistant_item)
+
+        self.assertIsInstance(history_renderable, Text)
+        self.assertIsInstance(assistant_renderable, Text)
+        self.assertEqual(
+            history_renderable.plain,
+            "Assistant (Thinking) > Reviewing the filing.",
+        )
+        self.assertIn(
+            _THINKING_HISTORY_PREFIX_STYLE,
+            [span.style for span in history_renderable.spans],
+        )
+        self.assertIn(
+            _THINKING_HISTORY_BODY_STYLE,
+            [span.style for span in history_renderable.spans],
+        )
+        self.assertIn(
+            _CHAT_PREFIX_STYLE,
+            [span.style for span in assistant_renderable.spans],
+        )
+        self.assertIn("white", [span.style for span in assistant_renderable.spans])
+        self.assertNotIn(_CHAT_PREFIX_STYLE, [span.style for span in history_renderable.spans])
+        self.assertNotIn("white", [span.style for span in history_renderable.spans])
 
     def test_thinking_tool_assistant_chronology_preserves_thinking_history(self) -> None:
         """真实 thinking 历史在 tool 和最终 assistant 之后仍应可见。"""
@@ -572,7 +622,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         )
 
         text = app._render_timeline_text()
-        thinking_index = text.index("Assistant > Inspecting the filing.")
+        thinking_index = text.index("Assistant (Thinking) > Inspecting the filing.")
         tool_index = text.index("Tool fileglide_read_text")
         assistant_index = text.index("Assistant > Done reviewing.")
 
