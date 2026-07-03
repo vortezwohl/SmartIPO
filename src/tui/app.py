@@ -326,7 +326,8 @@ class AgentWorkbenchApp(App[None]):
                 metadata=self._event_data_dict(event),
             )
             return
-        item = self._get_item(self._active_tools.get(tool_key, ""))
+        item_key = self._resolve_active_tool_item_key(tool_key, event.name or "")
+        item = self._get_item(item_key)
         if item is None:
             key = self._append_item(
                 kind="tool",
@@ -350,6 +351,22 @@ class AgentWorkbenchApp(App[None]):
             item.preview = event.text
         if event.status in {"completed", "failed", "cancelled"}:
             self._active_tools.pop(tool_key, None)
+
+    def _resolve_active_tool_item_key(self, tool_key: str, tool_name: str) -> str:
+        """尽量把 tool 终态重新挂回已有运行项，避免同一次调用被渲染成两条。"""
+
+        item_key = self._active_tools.get(tool_key, "")
+        if item_key:
+            return item_key
+        if not tool_name:
+            return ""
+        named_item_key = self._active_tools.get(tool_name, "")
+        if named_item_key:
+            if tool_key != tool_name:
+                self._active_tools[tool_key] = named_item_key
+                self._active_tools.pop(tool_name, None)
+            return named_item_key
+        return ""
 
     def _apply_assistant_event(self, event: AgentEvent) -> None:
         if event.status in {"started", "delta", "completed", "cancelled"}:
@@ -974,10 +991,9 @@ class AgentWorkbenchApp(App[None]):
         return message
 
     @staticmethod
-    def _render_tool_item_renderable(item: _TimelineItem) -> Group:
-        """渲染工具活动主行与后续概要行。"""
+    def _render_tool_item_renderable(item: _TimelineItem) -> Text:
+        """渲染只面向用户的一行工具活动摘要。"""
 
-        lines: list[Text] = []
         main_line = Text()
         main_line.append(AgentWorkbenchApp._format_duration(item.duration_ms), style=_TIMING_STYLE)
         main_line.append(" · ", style=_TIMING_STYLE)
@@ -987,36 +1003,11 @@ class AgentWorkbenchApp(App[None]):
         main_line.append(" · ", style=_TOOL_BLOCK_STYLE)
         main_line.append(AgentWorkbenchApp._format_status_label(item.status), style=_TOOL_BLOCK_STYLE)
         main_line.append(" }", style=_TOOL_BLOCK_STYLE)
-        lines.append(main_line)
-
-        tool_use_id = AgentWorkbenchApp._tool_use_id_from_metadata(item.metadata)
-        if tool_use_id:
-            lines.append(AgentWorkbenchApp._render_tool_detail_line("Call", tool_use_id))
-
-        error = str(item.metadata.get("error", "")).strip()
-        if item.status == "failed" and not error:
-            error = item.preview or item.body
-        if item.status == "failed" and error:
-            lines.append(
-                AgentWorkbenchApp._render_tool_detail_line(
-                    "Error",
-                    AgentWorkbenchApp._summarize_error_text(error),
-                )
-            )
-        if item.status == "completed" and item.preview:
-            lines.append(AgentWorkbenchApp._render_tool_detail_line("Summary", item.preview))
-        if item.status == "completed" and item.detail and item.detail != item.preview:
-            lines.append(AgentWorkbenchApp._render_tool_detail_line("Result", item.detail))
-        return Group(*lines)
-
-    @staticmethod
-    def _render_tool_detail_line(label: str, value: str) -> Text:
-        """渲染工具活动的英文后续标签行。"""
-
-        line = Text()
-        line.append(f"{label} ", style=_TOOL_BLOCK_STYLE)
-        line.append(value, style="white")
-        return line
+        summary = AgentWorkbenchApp._tool_user_summary(item)
+        if summary:
+            main_line.append(" · ", style=_TIMING_STYLE)
+            main_line.append(summary, style="white")
+        return main_line
 
     def _format_timeline_item(self, item: _TimelineItem) -> str:
         if item.kind in {"user", "assistant", "system", "compress"}:
@@ -1047,22 +1038,14 @@ class AgentWorkbenchApp(App[None]):
         return f"{item.title}{item.body}"
 
     def _format_tool_item(self, item: _TimelineItem) -> str:
-        lines = [
-            f"{self._format_duration(item.duration_ms)} · {{ Tool {item.name or 'tool'} · {self._format_status_label(item.status)} }}"
-        ]
-        tool_use_id = self._tool_use_id_from_metadata(item.metadata)
-        if tool_use_id:
-            lines.append(f"Call {tool_use_id}")
-        error = str(item.metadata.get("error", "")).strip()
-        if item.status == "failed" and not error:
-            error = item.preview or item.body
-        if item.status == "failed" and error:
-            lines.append(f"Error {self._summarize_error_text(error)}")
-        if item.status == "completed" and item.preview:
-            lines.append(f"Summary {item.preview}")
-        if item.status == "completed" and item.detail and item.detail != item.preview:
-            lines.append(f"Result {item.detail}")
-        return "\n".join(lines)
+        line = (
+            f"{self._format_duration(item.duration_ms)} · "
+            f"{{ Tool {item.name or 'tool'} · {self._format_status_label(item.status)} }}"
+        )
+        summary = self._tool_user_summary(item)
+        if summary:
+            return f"{line} · {summary}"
+        return line
 
     def _focus_chat_input(self) -> None:
         """让输入框在启动后获得焦点。"""
@@ -1126,6 +1109,30 @@ class AgentWorkbenchApp(App[None]):
         return str(metadata.get("tool_use_id", "")).strip()
 
     @staticmethod
+    def _tool_user_summary(item: _TimelineItem) -> str:
+        """提取用户可见的一行工具概要，完整结果继续留在内部状态。"""
+
+        if item.status == "failed":
+            error = str(item.metadata.get("error", "")).strip()
+            if not error:
+                error = item.preview or item.body or item.detail
+            summary = AgentWorkbenchApp._summarize_error_text(error)
+            if summary:
+                return f"Error: {summary}"
+            return ""
+        summary = item.preview or item.body or item.detail
+        return AgentWorkbenchApp._single_line_text(summary)
+
+    @staticmethod
+    def _single_line_text(text: str) -> str:
+        """把文本压缩为首个非空行，避免主 timeline 出现多行工具输出。"""
+
+        lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+        if not lines:
+            return str(text).strip()
+        return lines[0]
+
+    @staticmethod
     def _summarize_error_text(text: str) -> str:
         """把异常文本压缩为适合终端主 timeline 展示的摘要。"""
 
@@ -1133,7 +1140,7 @@ class AgentWorkbenchApp(App[None]):
         if not cleaned:
             return ""
         if "Traceback (most recent call last):" not in cleaned:
-            return cleaned
+            return AgentWorkbenchApp._single_line_text(cleaned)
         lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
         if not lines:
             return cleaned

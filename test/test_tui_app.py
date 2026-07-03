@@ -189,10 +189,15 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(agent.prompts, ["整理 README"])
         self.assertIn("User > 整理 README", text)
-        self.assertIn("0.01s · { Tool fileglide_read_text · Done }", text)
-        self.assertIn("Call tool-1", text)
-        self.assertIn("Summary fileglide_read_text: README.md", text)
-        self.assertIn("Result README.md", text)
+        tool_line = next(
+            line for line in text.splitlines() if "Tool fileglide_read_text" in line
+        )
+        self.assertRegex(
+            tool_line,
+            r"^\d+\.\d{2}s · \{ Tool fileglide_read_text · Done \} · fileglide_read_text: README\.md$",
+        )
+        self.assertNotIn("Call tool-1", text)
+        self.assertNotIn("Result README.md", text)
         self.assertIn("Assistant > 已完成", text)
 
     async def test_failed_tool_event_is_visible(self) -> None:
@@ -224,8 +229,13 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.35)
             text = app._render_timeline_text()
 
-        self.assertIn("0.00s · { Tool fileglide_edit_text · Failed }", text)
-        self.assertIn("Error permission denied", text)
+        tool_line = next(
+            line for line in text.splitlines() if "Tool fileglide_edit_text" in line
+        )
+        self.assertRegex(
+            tool_line,
+            r"^\d+\.\d{2}s · \{ Tool fileglide_edit_text · Failed \} · Error: permission denied$",
+        )
 
     async def test_system_failure_is_rendered(self) -> None:
         """系统失败事件应进入本地展示态。"""
@@ -860,7 +870,13 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             text = app._render_timeline_text()
 
         tool_item = [item for item in app._items if item.kind == "tool"][-1]
-        self.assertIn("Error boom", text)
+        tool_line = next(
+            line for line in text.splitlines() if "Tool fileglide_edit_text" in line
+        )
+        self.assertRegex(
+            tool_line,
+            r"^\d+\.\d{2}s · \{ Tool fileglide_edit_text · Failed \} · Error: boom$",
+        )
         self.assertNotIn("Traceback (most recent call last):", text)
         self.assertEqual(tool_item.detail, traceback_text)
 
