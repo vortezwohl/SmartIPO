@@ -114,7 +114,7 @@ class AgentWorkbenchApp(App[None]):
     def on_mount(self) -> None:
         """挂载后刷新界面并启动本地运行态计时。"""
 
-        self._refresh_view()
+        self._refresh_view(force_follow=True)
         self.set_interval(
             _TIMELINE_REFRESH_INTERVAL_SECONDS,
             self._refresh_running_items,
@@ -129,6 +129,7 @@ class AgentWorkbenchApp(App[None]):
         if not prompt:
             return
         self._append_user_message(prompt)
+        self._start_local_thinking()
         self._render_timeline()
         self._run_turn_worker(prompt)
 
@@ -160,6 +161,8 @@ class AgentWorkbenchApp(App[None]):
     def _apply_agent_event(self, event: AgentEvent) -> None:
         """把 EasyHarness 事件应用到 TUI 本地展示态。"""
 
+        if event.kind != "thinking":
+            self._finalize_provisional_thinking()
         if event.kind == "thinking":
             self._apply_thinking_event(event)
         elif event.kind == "tool":
@@ -171,31 +174,40 @@ class AgentWorkbenchApp(App[None]):
         elif event.kind == "compress":
             self._apply_compress_event(event)
         self._status_message = self._format_event_status(event)
-        self._refresh_view()
+        self._refresh_view(force_follow=True)
 
     def _apply_thinking_event(self, event: AgentEvent) -> None:
         if event.status == "started":
-            self._active_by_kind["thinking"] = self._append_item(
-                kind="thinking",
-                title="thinking",
-                body=event.text or "",
-                status="started",
-                started_at=self._parse_started_at(event.started_at),
-            )
+            item = self._get_active_thinking_item()
+            if item is None:
+                self._active_by_kind["thinking"] = self._append_item(
+                    kind="thinking",
+                    title="thinking",
+                    body=event.text or "",
+                    status="started",
+                    started_at=self._parse_started_at(event.started_at),
+                )
+                return
+            item.status = "started"
+            if event.text:
+                item.body = event.text
+            item.metadata["provisional"] = False
             return
-        key = self._active_by_kind.get("thinking", "")
-        item = self._get_item(key)
+        item = self._get_active_thinking_item()
         if item is None:
             return
         if event.status == "delta" and event.text:
             item.body += event.text
+            item.metadata["provisional"] = False
             return
         if event.status in {"completed", "failed"}:
+            self._sync_running_item_duration(item)
             if event.text:
                 item.body = event.text
             item.status = event.status
-            item.duration_ms = event.duration_ms or item.duration_ms
+            item.duration_ms = max(item.duration_ms, event.duration_ms or 0)
             item.started_at = None
+            item.metadata["provisional"] = False
             self._active_by_kind.pop("thinking", None)
 
     def _apply_tool_event(self, event: AgentEvent) -> None:
@@ -294,6 +306,7 @@ class AgentWorkbenchApp(App[None]):
     def _complete_turn(self) -> None:
         """标记一轮流式会话自然完成。"""
 
+        self._finalize_provisional_thinking()
         self._turn_count += 1
         self._status_message = "回复完成。"
         self._refresh_view()
@@ -308,10 +321,35 @@ class AgentWorkbenchApp(App[None]):
             status="failed",
         )
         self._status_message = message
-        self._refresh_view()
+        self._refresh_view(force_follow=True)
 
     def _append_user_message(self, content: str) -> str:
         return self._append_item(kind="user", title="你", body=content)
+
+    def _start_local_thinking(self) -> None:
+        """在收到真实事件前先启动本地 thinking 占位与计时。"""
+
+        if self._get_active_thinking_item() is not None:
+            return
+        self._active_by_kind["thinking"] = self._append_item(
+            kind="thinking",
+            title="thinking",
+            status="started",
+            started_at=datetime.now(timezone.utc),
+            metadata={"provisional": True},
+        )
+
+    def _finalize_provisional_thinking(self) -> None:
+        """当真实输出已开始时，收口仅用于等待态展示的本地 thinking。"""
+
+        item = self._get_active_thinking_item()
+        if item is None or not item.metadata.get("provisional", False):
+            return
+        self._sync_running_item_duration(item)
+        item.status = "completed"
+        item.started_at = None
+        item.metadata["provisional"] = False
+        self._active_by_kind.pop("thinking", None)
 
     def _append_item(
         self,
@@ -352,6 +390,25 @@ class AgentWorkbenchApp(App[None]):
                 return item
         return None
 
+    def _get_active_thinking_item(self) -> _TimelineItem | None:
+        """返回当前仍处于活动中的 thinking 条目。"""
+
+        key = self._active_by_kind.get("thinking", "")
+        if not key:
+            return None
+        return self._get_item(key)
+
+    @staticmethod
+    def _sync_running_item_duration(item: _TimelineItem) -> None:
+        """用当前 UTC 时间刷新单个运行中条目的本地耗时。"""
+
+        if item.started_at is None:
+            return
+        duration_ms = int(
+            (datetime.now(timezone.utc) - item.started_at).total_seconds() * 1000
+        )
+        item.duration_ms = max(0, duration_ms)
+
     def _refresh_running_items(self) -> None:
         """刷新仍处于 started 状态的本地展示时长。"""
 
@@ -368,7 +425,7 @@ class AgentWorkbenchApp(App[None]):
         if changed:
             self._render_timeline()
 
-    def _refresh_view(self) -> None:
+    def _refresh_view(self, *, force_follow: bool = False) -> None:
         """刷新顶部状态和会话记录。"""
 
         try:
@@ -377,9 +434,9 @@ class AgentWorkbenchApp(App[None]):
             )
         except (NoMatches, ScreenStackError):
             return
-        self._render_timeline()
+        self._render_timeline(force_follow=force_follow)
 
-    def _render_timeline(self) -> None:
+    def _render_timeline(self, *, force_follow: bool = False) -> None:
         """刷新主会话记录区域。"""
 
         try:
@@ -387,7 +444,7 @@ class AgentWorkbenchApp(App[None]):
             scroll_widget = self.query_one("#timeline-scroll", VerticalScroll)
         except (NoMatches, ScreenStackError):
             return
-        should_follow = self._should_follow_scroll(scroll_widget)
+        should_follow = force_follow or self._should_follow_scroll(scroll_widget)
         timeline_widget.update(Text(self._render_timeline_text()))
         if should_follow:
             scroll_widget.scroll_end(animate=False)
