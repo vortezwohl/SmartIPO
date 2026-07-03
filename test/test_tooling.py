@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from easyharness import Agent, ModelConfig
 from src.agent import (
+    DEFAULT_BASIC_TOOL_NAMES,
     DEFAULT_BUSINESS_TOOL_NAMES,
     DEFAULT_FILEGLIDE_TOOL_NAMES,
     DEFAULT_SYSTEM_PROMPT,
@@ -30,6 +31,11 @@ class EasyHarnessToolingTests(unittest.TestCase):
 
         self.assertIn("fileglide_read_text", DEFAULT_FILEGLIDE_TOOL_NAMES)
         self.assertIn("fileglide_edit_text", DEFAULT_FILEGLIDE_TOOL_NAMES)
+        self.assertEqual(
+            DEFAULT_BASIC_TOOL_NAMES,
+            ("calculator", "now", "web_fetch_page"),
+        )
+        self.assertIn("calculator", DEFAULT_BUSINESS_TOOL_NAMES)
         self.assertIn("fmp_get_profile", DEFAULT_BUSINESS_TOOL_NAMES)
         self.assertEqual(len(FMP_TOOL_NAMES), 38)
         self.assertEqual(
@@ -47,6 +53,9 @@ class EasyHarnessToolingTests(unittest.TestCase):
 
         self.assertIn("fileglide_read_text", names)
         self.assertIn("fileglide_search_text", names)
+        self.assertIn("calculator", names)
+        self.assertIn("now", names)
+        self.assertIn("web_fetch_page", names)
         self.assertIn("fmp_get_profile", names)
 
     def test_build_default_agent_returns_easyharness_agent(self) -> None:

@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from easyharness import Agent, ModelConfig
 from easyharness.toolset import build_fileglide_tools
 
-from src.tool import FMP_TOOL_NAMES, build_fmp_tools
+from src.tool import BASIC_TOOL_NAMES, FMP_TOOL_NAMES, build_basic_tools, build_fmp_tools
 
 load_dotenv()
 
@@ -43,7 +43,12 @@ DEFAULT_FILEGLIDE_TOOL_NAMES = (
     "fileglide_inspect_path",
 )
 
+DEFAULT_BASIC_TOOL_NAMES = (
+    *BASIC_TOOL_NAMES,
+)
+
 DEFAULT_BUSINESS_TOOL_NAMES = (
+    *DEFAULT_BASIC_TOOL_NAMES,
     *FMP_TOOL_NAMES,
 )
 
@@ -89,6 +94,7 @@ def build_default_tools(workspace_root: str | None = None) -> list[object]:
     root = workspace_root or os.getcwd()
     return [
         *build_fileglide_tools(default_root=root),
+        *build_basic_tools(),
         *build_fmp_tools(),
     ]
 
