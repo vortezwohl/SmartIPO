@@ -74,18 +74,18 @@ def _extract_text_excerpt(raw_text: str, content_type: str) -> str:
 
 @tool(
     name="calculator",
-    purpose="Evaluate or simplify one math expression with SymPy.",
+    purpose="计算或化简单个数学表达式。",
     when_to_use=(
-        "Use when the task needs a quick arithmetic calculation or symbolic "
-        "simplification from a single math expression."
+        "当任务只需要一次快速算术计算、代数化简或符号表达式求值时使用；"
+        "不适合多步骤数据分析或需要外部数据源的计算。"
     ),
     parameters={
-        "expression": "A single math expression string, such as '(2 + 2) * 5' or 'sin(x)**2 + cos(x)**2'.",
+        "expression": "单个数学表达式字符串，例如 '(2 + 2) * 5'、'sin(x)**2 + cos(x)**2'。",
     },
-    returns="Returns the original expression and the computed or simplified result string.",
+    returns="返回原始表达式与计算结果字符串，适合直接继续推理或写入结论。",
     common_failures=(
-        "The expression is empty.",
-        "SymPy cannot parse the input expression.",
+        "expression 为空。",
+        "SymPy 无法解析输入表达式。",
     ),
 )
 def basic_calculator(expression: str) -> ToolOutput:
@@ -116,15 +116,14 @@ def basic_calculator(expression: str) -> ToolOutput:
 
 @tool(
     name="now",
-    purpose="Return the current local date and time with millisecond precision.",
-    when_to_use="Use when the task needs the current year, date, time, timezone, or millisecond timestamp.",
+    purpose="返回当前本地日期时间与毫秒时间戳。",
+    when_to_use="当任务需要当前年份、日期、时间、时区或毫秒时间戳时使用。",
     parameters={},
     returns=(
-        "Returns the current local year, date, time, ISO 8601 datetime string, timezone, "
-        "and Unix timestamp in milliseconds."
+        "返回当前本地 year、date、time、ISO 8601 时间串、timezone 和毫秒级 Unix 时间戳。"
     ),
     common_failures=(
-        "System clock access fails unexpectedly.",
+        "系统时钟访问异常失败。",
     ),
 )
 def now() -> ToolOutput:
@@ -157,22 +156,22 @@ def now() -> ToolOutput:
 
 @tool(
     name="web_fetch_page",
-    purpose="Fetch one web page and return a lightweight text summary.",
+    purpose="抓取单个网页并返回轻量文本摘要。",
     when_to_use=(
-        "Use when the task only needs a simple HTTP fetch of a public page and does not "
-        "need browser automation, clicks, screenshots, or JavaScript execution."
+        "当任务只需要对公开网页做一次简单 HTTP 抓取，并不需要浏览器自动化、点击、截图"
+        "或 JavaScript 执行时使用。"
     ),
     parameters={
-        "url": "The target http or https URL to fetch.",
-        "timeout_seconds": "Optional request timeout in seconds. Defaults to 10.",
+        "url": "需要抓取的 http 或 https URL。",
+        "timeout_seconds": "可选请求超时时间，单位为秒；默认 10 秒。",
     },
     returns=(
-        "Returns the response status, final URL, content type, page title if present, "
-        "and a plain-text excerpt."
+        "返回响应状态、最终 URL、内容类型、页面标题（若存在）与正文摘录；"
+        "正文摘录可能被截断，且不会执行页面脚本。"
     ),
     common_failures=(
-        "The URL is empty or does not use http/https.",
-        "The network request fails or the server returns an HTTP error.",
+        "URL 为空或不属于 http/https。",
+        "网络请求失败或服务端返回 HTTP 错误。",
     ),
 )
 def web_fetch_page(url: str, timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS) -> ToolOutput:

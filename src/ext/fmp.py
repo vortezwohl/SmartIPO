@@ -155,6 +155,66 @@ class FmpClient:
         """获取轻量化 EOD 历史价格。"""
         return self._get_symbol_resource("historical-price-eod/light", symbol, **params)
 
+    def get_historical_price_eod_full(
+        self,
+        symbol: str,
+        *,
+        from_date: str = "",
+        to_date: str = "",
+        **params: Any,
+    ) -> Any:
+        """获取完整 EOD 历史价格。
+
+        Args:
+            symbol: 股票代码。
+            from_date: 开始日期，最终会映射到 FMP 的 `from` query 参数。
+            to_date: 结束日期，最终会映射到 FMP 的 `to` query 参数。
+            **params: 其他需要透传给 FMP 的查询参数。
+
+        Returns:
+            FMP 返回的完整 EOD 历史价格原始 JSON。
+        """
+        normalized_symbol = symbol.strip().upper()
+        if not normalized_symbol:
+            raise ValueError("symbol 不能为空。")
+        return self._get(
+            "historical-price-eod/full",
+            symbol=normalized_symbol,
+            **self._with_date_range(from_date, to_date, params),
+        )
+
+    def get_historical_market_cap(
+        self,
+        symbol: str,
+        *,
+        from_date: str = "",
+        to_date: str = "",
+        **params: Any,
+    ) -> Any:
+        """获取历史市值序列。
+
+        Args:
+            symbol: 股票代码。
+            from_date: 开始日期，最终会映射到 FMP 的 `from` query 参数。
+            to_date: 结束日期，最终会映射到 FMP 的 `to` query 参数。
+            **params: 其他需要透传给 FMP 的查询参数。
+
+        Returns:
+            FMP 返回的历史市值原始 JSON。
+        """
+        normalized_symbol = symbol.strip().upper()
+        if not normalized_symbol:
+            raise ValueError("symbol 不能为空。")
+        return self._get(
+            "historical-market-capitalization",
+            symbol=normalized_symbol,
+            **self._with_date_range(from_date, to_date, params),
+        )
+
+    def get_company_screener(self, **params: Any) -> Any:
+        """获取公司筛选结果。"""
+        return self._get("company-screener", **params)
+
     def get_income_statement(self, symbol: str, **params: Any) -> Any:
         """获取利润表。"""
         return self._get_symbol_resource("income-statement", symbol, **params)

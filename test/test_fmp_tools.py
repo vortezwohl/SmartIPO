@@ -96,6 +96,53 @@ class _FakeCalendarClient:
         ]
 
 
+class _FakeHistoricalPriceClient:
+    """用于验证 symbol + 日期区间类工具委托行为的最小替身。"""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def get_historical_price_eod_full(
+        self,
+        symbol: str,
+        *,
+        from_date: str = "",
+        to_date: str = "",
+        **params: object,
+    ) -> list[dict[str, object]]:
+        """记录调用参数并返回最小结果。"""
+
+        self.calls.append(
+            {
+                "symbol": symbol,
+                "from_date": from_date,
+                "to_date": to_date,
+                "params": params,
+            }
+        )
+        return [
+            {
+                "symbol": symbol,
+                "from_date": from_date,
+                "to_date": to_date,
+                "params": params,
+            }
+        ]
+
+
+class _FakeScreenerClient:
+    """用于验证 company screener 工具委托行为的最小替身。"""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def get_company_screener(self, **params: object) -> list[dict[str, object]]:
+        """记录调用参数并返回最小结果。"""
+
+        self.calls.append(params)
+        return [{"params": params}]
+
+
 class _RaisingProfileClient:
     """用于模拟底层 HTTP 失败的最小替身。"""
 
@@ -164,6 +211,67 @@ class FmpEasyHarnessToolTests(unittest.TestCase):
         )
         self.assertEqual(output.data["request"]["extra_params"], {"page": 2})
         self.assertIn("返回 1 条记录", output.preview)
+
+    def test_symbol_date_range_tool_delegates_symbol_window_and_extra_params(self) -> None:
+        """symbol + 日期区间类工具应保留显式代码和时间窗口。"""
+
+        fake_client = _FakeHistoricalPriceClient()
+        tool_obj = _find_tool("fmp_get_historical_price_eod_full")
+
+        with patch("src.tool.fmp_tools._create_client", return_value=fake_client):
+            output = tool_obj(
+                symbol="aapl",
+                from_date="2025-01-01",
+                to_date="2025-01-31",
+                extra_params={"limit": 5, "symbol": "MSFT", "from_date": "ignored"},
+            )
+
+        self.assertEqual(
+            fake_client.calls,
+            [
+                {
+                    "symbol": "aapl",
+                    "from_date": "2025-01-01",
+                    "to_date": "2025-01-31",
+                    "params": {"limit": 5},
+                }
+            ],
+        )
+        self.assertEqual(output.data["request"]["symbol"], "aapl")
+        self.assertEqual(output.data["request"]["from_date"], "2025-01-01")
+        self.assertEqual(output.data["request"]["to_date"], "2025-01-31")
+        self.assertEqual(output.data["request"]["extra_params"], {"limit": 5})
+
+    def test_extra_params_tool_delegates_company_screener_filters(self) -> None:
+        """company screener 工具应保留结构化筛选参数。"""
+
+        fake_client = _FakeScreenerClient()
+        tool_obj = _find_tool("fmp_get_company_screener")
+
+        with patch("src.tool.fmp_tools._create_client", return_value=fake_client):
+            output = tool_obj(
+                extra_params={
+                    "sector": "Technology",
+                    "marketCapMoreThan": 10000000000,
+                }
+            )
+
+        self.assertEqual(
+            fake_client.calls,
+            [
+                {
+                    "sector": "Technology",
+                    "marketCapMoreThan": 10000000000,
+                }
+            ],
+        )
+        self.assertEqual(
+            output.data["request"]["extra_params"],
+            {
+                "sector": "Technology",
+                "marketCapMoreThan": 10000000000,
+            },
+        )
 
     def test_stream_reports_missing_api_key_as_failed_tool_event(self) -> None:
         """缺少 FMP API Key 时，工具事件流必须显式失败。"""

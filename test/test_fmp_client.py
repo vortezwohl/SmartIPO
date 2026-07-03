@@ -183,6 +183,71 @@ class FmpClientTests(unittest.TestCase):
             },
         )
 
+    def test_market_data_endpoints_map_expected_paths_and_params(self) -> None:
+        """新增市场数据接口应映射到正确路径并保留查询参数。"""
+
+        session = _FakeSession()
+        client = FmpClient(api_key="test-key", session=session)
+
+        client.get_historical_price_eod_full(
+            "aapl",
+            from_date="2025-01-01",
+            to_date="2025-01-31",
+            limit=10,
+        )
+        client.get_historical_market_cap(
+            "msft",
+            from_date="2024-06-01",
+            to_date="2024-06-30",
+        )
+        client.get_company_screener(
+            marketCapMoreThan=10000000000,
+            sector="Technology",
+            isEtf=False,
+        )
+
+        self.assertEqual(len(session.calls), 3)
+        self.assertEqual(
+            session.calls[0]["url"],
+            "https://financialmodelingprep.com/stable/historical-price-eod/full",
+        )
+        self.assertEqual(
+            session.calls[0]["params"],
+            {
+                "apikey": "test-key",
+                "symbol": "AAPL",
+                "from": "2025-01-01",
+                "to": "2025-01-31",
+                "limit": 10,
+            },
+        )
+        self.assertEqual(
+            session.calls[1]["url"],
+            "https://financialmodelingprep.com/stable/historical-market-capitalization",
+        )
+        self.assertEqual(
+            session.calls[1]["params"],
+            {
+                "apikey": "test-key",
+                "symbol": "MSFT",
+                "from": "2024-06-01",
+                "to": "2024-06-30",
+            },
+        )
+        self.assertEqual(
+            session.calls[2]["url"],
+            "https://financialmodelingprep.com/stable/company-screener",
+        )
+        self.assertEqual(
+            session.calls[2]["params"],
+            {
+                "apikey": "test-key",
+                "marketCapMoreThan": 10000000000,
+                "sector": "Technology",
+                "isEtf": False,
+            },
+        )
+
     def test_http_errors_bubble_up_without_being_hidden(self) -> None:
         """FMP 非 2xx 响应必须继续向上暴露异常。"""
 
