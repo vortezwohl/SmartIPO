@@ -148,6 +148,12 @@ class EasyHarnessToolingTests(unittest.TestCase):
         self.assertIn("1个月、6个月、1年、3年、5年", DEFAULT_SYSTEM_PROMPT)
         self.assertIn("货币/经济政策、地缘政治、广泛市场情绪、资金流向", DEFAULT_SYSTEM_PROMPT)
         self.assertIn("利率路径、联储口径、通胀/就业数据", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("必须联网获取最新信息", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("A=官方一级源", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("D=社媒、论坛、传闻、二手转述", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("情绪化判断/未经证实传闻", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("信息面审计摘要", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("全程去情绪化、去煽动化、去立场化", DEFAULT_SYSTEM_PROMPT)
         self.assertIn(DEFAULT_REPORT_FOLLOW_UP, DEFAULT_SYSTEM_PROMPT)
         self.assertNotIn("text.read", DEFAULT_SYSTEM_PROMPT)
 
