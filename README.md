@@ -6,16 +6,15 @@
     </strong>
   </p>
   <p>
-    <a href="https://github.com/vortezwohl/EasyHarness">EasyHarness</a>
-    ·
-    <a href="https://github.com/Textualize/textual">Textual</a>
-    ·
-    <a href="https://site.financialmodelingprep.com/">FMP</a>
-  </p>
-  <p>
     <img src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&amp;logoColor=white" alt="Python 3.10+" />
     <a href="https://github.com/vortezwohl/EasyHarness">
       <img src="https://img.shields.io/badge/EasyHarness-agent%20loop-2563EB?logo=github&amp;logoColor=white" alt="EasyHarness" />
+    </a>
+    <a href="https://github.com/vortezwohl/FileGlide">
+      <img src="https://img.shields.io/badge/fileglide-filesystem%20toolset-2563EB?logo=github&amp;logoColor=white" alt="fileglide" />
+    </a>
+    <a href="https://github.com/vortezwohl/vortezwohl-sdk">
+      <img src="https://img.shields.io/badge/vortezwohl-fuzzy%20matching-2563EB?logo=github&amp;logoColor=white" alt="vortezwohl" />
     </a>
     <a href="https://github.com/Textualize/textual">
       <img src="https://img.shields.io/badge/Textual-TUI-1F6FEB?logo=github&amp;logoColor=white" alt="Textual" />
