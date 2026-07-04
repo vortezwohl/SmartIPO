@@ -1,39 +1,119 @@
-# OpenBuffett
+<div align="center">
+  <h1>OpenBuffett</h1>
+  <p>
+    <strong>
+      An autonomous agent that study companies the way Buffett does.<br>For professional-grade company study, comparables analysis, and disciplined price discovery.
+    </strong>
+  </p>
+  <p>
+    <a href="https://github.com/vortezwohl/EasyHarness">EasyHarness</a>
+    ·
+    <a href="https://github.com/Textualize/textual">Textual</a>
+    ·
+    <a href="https://site.financialmodelingprep.com/">FMP</a>
+  </p>
+  <p>
+    <img src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&amp;logoColor=white" alt="Python 3.10+" />
+    <a href="https://github.com/vortezwohl/EasyHarness">
+      <img src="https://img.shields.io/badge/EasyHarness-agent%20loop-2563EB?logo=github&amp;logoColor=white" alt="EasyHarness" />
+    </a>
+    <a href="https://github.com/Textualize/textual">
+      <img src="https://img.shields.io/badge/Textual-TUI-1F6FEB?logo=github&amp;logoColor=white" alt="Textual" />
+    </a>
+    <a href="https://site.financialmodelingprep.com/">
+      <img src="https://img.shields.io/badge/FMP-financial%20data-0F766E?logoColor=white" alt="FMP" />
+    </a>
+  </p>
+  <p>
+    <sub>
+      Built to narrow the research gap between retail investors and institutions.
+    </sub>
+  </p>
+</div>
 
-OpenBuffett 是一个以美股专业级估值分析为主轴的研究 workbench，当前能力优先级为：
+<h4 align="center">
+  <p>
+    <b>English</b> |
+    <a href="./i18n/README_zh-hans.md">简体中文</a>
+  </p>
+</h4>
 
-- 专业级估值分析：围绕公司质量、财务质量、估值区间、可比公司，以及 `1个月 / 6个月 / 1年 / 3年 / 5年` 视角输出结论先行的研究；其中短期视角必须补看货币/经济政策、地缘政治、广泛市场情绪与资金流向。
-- 打新分析：仅针对尚未上市、正在申购或即将申购的美股新股，在估值分析基础上继续研读招股书、发行结构、稀释、锁定期与市场情绪。
-- 市场数据辅助：查看股票、ETF 及当前数据面可严谨覆盖标的的历史 OHLC、市值与相关行情线索。
+## Project Overview
 
-当前项目已收敛到 EasyHarness 主干架构：
+OpenBuffett is a valuation-first US equity research workbench built to help investors conduct company research with institutional discipline.
 
-- 默认 agent runtime 使用 `easyharness.Agent`。
-- 默认纯文本生成使用 EasyHarness 无工具 agent，不再维护项目私有文本生成包装层。
-- 默认文件系统工具使用 EasyHarness 官方 fileglide toolset。
-- 自定义业务工具使用 `easyharness.tool` 声明。
-- 默认业务工具当前只保留面向美股估值分析、IPO/打新研究与财报数据查询的 FMP 工具集。
-- TUI 直接消费 `easyharness.AgentEvent` 流，不再维护项目自研 timeline 协议。
-- 默认装配入口位于 `src.agent`，只负责模型配置、system prompt 和工具集合。
+It combines large-scale AI information processing with structured financial workflows so users can study businesses, compare peers, and reason about valuation more rigorously. The core objective is to reduce the gap between what professional researchers can process and what most individual investors can realistically analyze on their own.
 
-## 当前研究边界
+In practical terms, OpenBuffett is designed to help more investors research companies with the depth, structure, and skepticism usually associated with long-horizon fundamental investors.
 
-- 默认业务范围暂限美股。
-- 若用户提供的是公司名称、模糊名称或可能有笔误的名称，agent 会先推断候选 ticker，并要求用户确认后再进入正式估值分析。
-- 凡涉及信息面、政策、地缘政治、市场情绪、资金流、新闻事件或 IPO 进度，agent 必须联网获取最新信息，并对来源做可信度分级，而不是盲信单一媒体或传闻。
-- 对期货、期权、广义衍生品、加密资产等，若当前数据面不足以严谨验证，agent 会明确承认边界，而不会伪装成完整支持。
-- agent 默认保持去情绪化、可审计表达；输出中会尽量保留精简版来源、时间戳、置信等级与未证实项说明。
-- 完整研究结束后，agent 会主动询问是否在当前工作路径下生成中文 Markdown 研究报告。
+## Pain Points and Use Cases
 
-## 本地运行
+Most retail investors do not fail because they lack interest. They fail because serious valuation work requires too much primary-source reading, too much accounting context, and too much information synthesis under time pressure.
 
-```powershell
-.\.venv\Scripts\python -m src.tui
+OpenBuffett is designed for professional-grade company research and valuation analysis, pushing toward research **parity** between retail investors and institutions. It is especially useful when a user needs to:
+
+- understand whether a business is expensive or cheap at the current market price
+- compare a company against relevant peers instead of relying on isolated multiples
+- review financial statements, filings, and market narratives in one research flow
+- study a not-yet-listed US IPO before subscription opens or closes
+- pull market data, historical price paths, and market capitalization history as research inputs
+
+## Core Innovations
+
+OpenBuffett is purpose-built for deep investment research, especially valuation work, rather than being a generic chat agent with a finance wrapper.
+
+Its design goal is simple: put a Buffett-like research process on every investor's desktop by compensating for limits in knowledge breadth, primary-source reading capacity, and large-scale information processing.
+
+That makes it easier to avoid buying great companies at bubble valuations, or missing strong businesses when they are still misunderstood or underpriced.
+
+## Core Capabilities
+
+The current capability contract is defined by the default agent composition and system prompt in `src/agent.py`. In its current product surface, OpenBuffett focuses on five core behaviors:
+
+1. Ticker disambiguation before formal analysis when the user provides a company name, alias, shorthand, or ambiguous identifier.
+2. Valuation-first research centered on business quality, financial quality, implied expectations, and deep comparable-company analysis.
+3. Multi-horizon judgment across 1 month, 6 months, 1 year, 3 years, and 5 years, with short-horizon views explicitly tied to macro policy, rates, sentiment, and capital flows.
+4. IPO analysis only when the target is a not-yet-listed US offering that is currently open or about to open for subscription.
+5. Source-aware research with explicit evidence grading, latest-information checks, audit-style output boundaries, and a clear distinction between verified facts, inferences, and unverified items.
+
+The agent also supports market-data-assisted research for the current data surface, including historical OHLC, market capitalization history, SEC filings, financial statements, key metrics, ratios, estimates, transcripts, insider activity, and related macro inputs supported by FMP.
+
+## Technology Stack
+
+OpenBuffett is built on three primary layers:
+
+- **EasyHarness**: my self-developed agent-loop framework. It provides the runtime foundation, streaming event model, tool contracts, and scoped local-workbench integration used by the default agent.
+- **Textual**: the TUI layer that turns the agent into an interactive local research workbench instead of a one-shot script.
+- **Financial Modeling Prep (FMP)**: the structured US equity data layer used for market data, company profiles, SEC filings, financial statements, valuation inputs, estimates, comparables, transcripts, insider activity, macro context, and IPO-related datasets.
+
+At the repository level, the default product surface is intentionally narrow: OpenBuffett stays focused on US-equity valuation research first, then IPO research, then market-data assistance.
+
+## Quick Start
+
+```bash
+git clone https://github.com/vortezwohl/SmartIPO.git
+cd SmartIPO
+uv sync
+python -m src.tui
 ```
 
-运行前需要配置默认模型渠道所需的环境变量：
+Before the first real run, configure the environment variables required by the default agent runtime:
 
-- `API_KEY`: 模型 API key。
-- `API_BASE`: 可选，未配置时使用 `src.agent` 中的默认 base URL。
-- `FMP_API_KEY`: 可选；未配置时 workbench 仍可启动，但 FMP 工具在真实调用时会显式失败。
-- `FMP_API_BASE`: 可选；未配置时使用 `src.ext.fmp` 中的默认 FMP stable base URL。
+- `API_KEY`: required model API key.
+- `API_BASE`: optional model base URL override. By default, OpenBuffett uses DeepSeek through `https://api.deepseek.com/v1`, and the default model in `src/agent.py` is `openai/deepseek-v4-pro`. Any OpenAI-compatible model provider can be used as long as `API_BASE` points to that provider's compatible endpoint and `API_KEY` matches it.
+- `FMP_API_KEY`: required FMP API key. OpenBuffett's core research flow depends on FMP-backed market and company data, so real runs without this key are not supported.
+- `FMP_API_BASE`: optional FMP base URL override.
+
+## Citation
+
+If you use OpenBuffett in academic, research, or industry work, cite the repository as software:
+
+```bibtex
+@software{Wu_OpenBuffett_2026,
+  author = {Wu, Zihao},
+  title = {{OpenBuffett}},
+  url = {https://github.com/vortezwohl/OpenBuffett},
+  version = {0.1.0},
+  year = {2026}
+}
+```

@@ -1,7 +1,7 @@
 [project]
 name = "openbuffett"
 version = "0.1.0"
-description = "Valuation-first US equity research workbench"
+description = "An autonomous agent that study companies the way Buffett does."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
