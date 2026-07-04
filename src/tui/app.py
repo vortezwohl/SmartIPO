@@ -593,8 +593,12 @@ class AgentWorkbenchApp(App[None]):
             force_follow = self._pending_repaint_force_follow
         self._pending_repaint_force_follow = False
         self._full_repaint_scheduled = False
-        self.refresh(layout=True, repaint=True)
-        self._refresh_view(force_follow=force_follow)
+        self._refresh_view(schedule_follow=False)
+        try:
+            self.query_one("#body", Vertical).refresh(layout=True, repaint=True)
+        except (NoMatches, ScreenStackError):
+            self.refresh(layout=True, repaint=True)
+        self._schedule_timeline_follow(force_follow=force_follow)
 
     def _start_local_thinking(self) -> None:
         """在收到真实事件前先启动本地 thinking 占位与计时。"""
@@ -967,7 +971,12 @@ class AgentWorkbenchApp(App[None]):
             return None
         return best_match
 
-    def _refresh_view(self, *, force_follow: bool = False) -> None:
+    def _refresh_view(
+        self,
+        *,
+        force_follow: bool = False,
+        schedule_follow: bool = True,
+    ) -> None:
         """刷新顶部状态和会话记录。"""
 
         try:
@@ -976,26 +985,43 @@ class AgentWorkbenchApp(App[None]):
             )
         except (NoMatches, ScreenStackError):
             return
-        self._render_timeline(force_follow=force_follow)
+        self._render_timeline(
+            force_follow=force_follow,
+            schedule_follow=schedule_follow,
+        )
         self._render_queue_tray()
 
-    def _render_timeline(self, *, force_follow: bool = False) -> None:
+    def _render_timeline(
+        self,
+        *,
+        force_follow: bool = False,
+        schedule_follow: bool = True,
+    ) -> None:
         """刷新主会话记录区域。"""
 
         try:
             timeline_widget = self.query_one("#timeline-view", Static)
+        except (NoMatches, ScreenStackError):
+            return
+        timeline_widget.update(self._render_timeline_renderable())
+        if schedule_follow:
+            self._schedule_timeline_follow(force_follow=force_follow)
+
+    def _schedule_timeline_follow(self, *, force_follow: bool = False) -> None:
+        """在最终布局稳定后再决定是否跟随到底部。"""
+
+        try:
             scroll_widget = self.query_one("#timeline-scroll", VerticalScroll)
         except (NoMatches, ScreenStackError):
             return
-        should_follow = force_follow or self._should_follow_scroll(scroll_widget)
-        timeline_widget.update(self._render_timeline_renderable())
-        if should_follow:
-            self.call_after_refresh(
-                scroll_widget.scroll_end,
-                animate=False,
-                force=True,
-                immediate=True,
-            )
+        if not (force_follow or self._should_follow_scroll(scroll_widget)):
+            return
+        self.call_after_refresh(
+            scroll_widget.scroll_end,
+            animate=False,
+            force=True,
+            immediate=True,
+        )
 
     def _render_queue_tray(self) -> None:
         """刷新待处理消息托盘。"""

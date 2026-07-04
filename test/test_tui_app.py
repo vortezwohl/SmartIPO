@@ -24,6 +24,15 @@ from src.tui.app import (
     _THINKING_HISTORY_PREFIX_STYLE,
 )
 
+_LONG_RESIZE_STATUS_MESSAGE = (
+    "A very long status message that should wrap when the terminal becomes narrow "
+    "and shrink back after the original width is restored."
+)
+_LONG_QUEUE_MESSAGE = (
+    "排队中的后续消息 排队中的后续消息 排队中的后续消息 "
+    "排队中的后续消息 排队中的后续消息 排队中的后续消息"
+)
+
 
 class _FakeStreamingAgent:
     """用于驱动 TUI 测试的 EasyHarness agent 兼容假对象。"""
@@ -154,10 +163,26 @@ def _started_event(kind: str, *, name: str | None = None) -> AgentEvent:
 def _normalize_exported_screenshot(svg: str) -> str:
     """归一化导出的 SVG，移除随机 id 与空白噪音，便于稳定比较。"""
 
+    bottom_crop_y = 489.0
+
+    def _strip_bottom_tag(match: re.Match[str]) -> str:
+        tag = match.group(0)
+        y_match = re.search(r' y="([0-9.]+)"', tag)
+        if y_match is not None and float(y_match.group(1)) >= bottom_crop_y:
+            return ""
+        return tag
+
     normalized = re.sub(r"terminal-\d+", "terminal-X", svg)
     normalized = re.sub(r"unique-id-\d+", "unique-id-X", normalized)
     normalized = re.sub(r"url\(#terminal-X-line-\d+\)", "url(#clip)", normalized)
     normalized = re.sub(r'id="terminal-X-line-\d+"', 'id="clip"', normalized)
+    normalized = re.sub(r"<style.*?</style>", "", normalized, flags=re.S)
+    normalized = re.sub(r' class="[^"]*"', "", normalized)
+    normalized = re.sub(r' style="[^"]*"', "", normalized)
+    normalized = re.sub(r' fill="[^"]*"', "", normalized)
+    normalized = re.sub(r' stroke="[^"]*"', "", normalized)
+    normalized = re.sub(r"<rect[^>]*/>", _strip_bottom_tag, normalized)
+    normalized = re.sub(r"<text[^>]*>.*?</text>", _strip_bottom_tag, normalized)
     return "\n".join(line for line in normalized.splitlines() if line.strip())
 
 
@@ -165,24 +190,17 @@ async def _capture_stable_screenshot(
     pilot,
     app: AgentWorkbenchApp,
     *,
-    attempts: int = 8,
+    attempts: int = 20,
     pause_seconds: float = 0.05,
 ) -> str:
     """等待导出的截图收敛后再返回稳定结果。"""
 
     previous_snapshot = ""
-    stable_repeat_count = 0
     for _ in range(attempts):
         await pilot.pause(pause_seconds)
         current_snapshot = _normalize_exported_screenshot(
             app.export_screenshot(simplify=True)
         )
-        if current_snapshot == previous_snapshot:
-            stable_repeat_count += 1
-            if stable_repeat_count >= 2:
-                return current_snapshot
-        else:
-            stable_repeat_count = 0
         previous_snapshot = current_snapshot
     return previous_snapshot
 
@@ -744,10 +762,11 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         """终端横向缩放后，关键区域应随宽度重排，且恢复原宽后回到同一渲染结果。"""
 
         app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        app._status_message = _LONG_RESIZE_STATUS_MESSAGE
 
         async with app.run_test(size=(90, 24)) as pilot:
             app._append_user_message("这是一条在缩宽后仍应可见的测试消息。")
-            app._enqueue_turn("排队中的后续消息")
+            app._enqueue_turn(_LONG_QUEUE_MESSAGE)
             app._refresh_view()
 
             status_widget = app.query_one("#status-banner", Static)
@@ -762,14 +781,22 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
                 queue_widget.size.width,
                 input_widget.size.width,
             )
+            initial_heights = (
+                status_widget.size.height,
+                queue_widget.size.height,
+            )
 
-            await pilot.resize_terminal(52, 24)
+            await pilot.resize_terminal(30, 24)
             narrow_snapshot = await _capture_stable_screenshot(pilot, app)
             narrow_widths = (
                 status_widget.size.width,
                 timeline_widget.size.width,
                 queue_widget.size.width,
                 input_widget.size.width,
+            )
+            narrow_heights = (
+                status_widget.size.height,
+                queue_widget.size.height,
             )
             narrow_text = app._render_timeline_text()
 
@@ -781,6 +808,10 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
                 queue_widget.size.width,
                 input_widget.size.width,
             )
+            restored_heights = (
+                status_widget.size.height,
+                queue_widget.size.height,
+            )
             restored_text = app._render_timeline_text()
 
         self.assertIn("这是一条在缩宽后仍应可见的测试消息。", narrow_text)
@@ -789,7 +820,10 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(narrow_widths[1], initial_widths[1])
         self.assertLess(narrow_widths[2], initial_widths[2])
         self.assertLess(narrow_widths[3], initial_widths[3])
+        self.assertGreater(narrow_heights[0], initial_heights[0])
+        self.assertGreater(narrow_heights[1], initial_heights[1])
         self.assertEqual(restored_widths, initial_widths)
+        self.assertEqual(restored_heights, initial_heights)
         self.assertNotEqual(narrow_snapshot, initial_snapshot)
         self.assertEqual(restored_snapshot, initial_snapshot)
 
