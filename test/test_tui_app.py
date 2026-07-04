@@ -603,6 +603,67 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("{", tool_renderable.plain)
         self.assertNotIn("}", tool_renderable.plain)
 
+    def test_same_name_tool_calls_rebind_by_started_at_without_leaking_running_item(self) -> None:
+        """同名工具在首选键漂移时也应按 started_at 收口到原始活动项。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        first_started_at = "2026-07-04T00:00:01+00:00"
+        second_started_at = "2026-07-04T00:00:02+00:00"
+
+        app._apply_agent_event(
+            AgentEvent(
+                kind="tool",
+                status="started",
+                name="fmp_get_profile",
+                started_at=first_started_at,
+            )
+        )
+        app._apply_agent_event(
+            AgentEvent(
+                kind="tool",
+                status="started",
+                name="fmp_get_profile",
+                started_at=second_started_at,
+            )
+        )
+        app._apply_agent_event(
+            AgentEvent(
+                kind="tool",
+                status="completed",
+                name="fmp_get_profile",
+                started_at=first_started_at,
+                duration_ms=1200,
+                data={
+                    "tool_use_id": "tool-1",
+                    "output": {"preview": "first result"},
+                },
+            )
+        )
+        app._apply_agent_event(
+            AgentEvent(
+                kind="tool",
+                status="completed",
+                name="fmp_get_profile",
+                started_at=second_started_at,
+                duration_ms=2200,
+                data={
+                    "tool_use_id": "tool-2",
+                    "output": {"preview": "second result"},
+                },
+            )
+        )
+
+        tool_items = [item for item in app._items if item.kind == "tool"]
+        text = app._render_timeline_text()
+
+        self.assertEqual(len(tool_items), 2)
+        self.assertEqual([item.status for item in tool_items], ["completed", "completed"])
+        self.assertTrue(all(item.started_at is None for item in tool_items))
+        self.assertEqual(tool_items[0].preview, "first result")
+        self.assertEqual(tool_items[1].preview, "second result")
+        self.assertEqual(text.count("Tool fmp_get_profile"), 2)
+        self.assertNotIn("Running", text)
+
     def test_runtime_thinking_text_becomes_visible_history(self) -> None:
         """收到真实 thinking 文本后，应通过 assistant 表面保留为可见历史。"""
 

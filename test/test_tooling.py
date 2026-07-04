@@ -6,10 +6,12 @@
 
 from __future__ import annotations
 
+import queue
 import unittest
 from unittest.mock import patch
 
 from easyharness import Agent, ModelConfig
+from easyharness._internal.runtime import _EventMapper
 from src.ext.fmp import FmpClient
 from src.agent import (
     DEFAULT_BASIC_TOOL_NAMES,
@@ -46,6 +48,47 @@ _KEY_FMP_RUNTIME_TOOL_NAMES = (
     "fmp_get_financial_estimates",
     "fmp_get_earnings_transcripts",
 )
+
+
+def _tool_stream_event(
+    *,
+    status: str,
+    name: str,
+    tool_use_id: str,
+    started_at: str,
+    duration_ms: int | None = None,
+    input_data: object | None = None,
+    output: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """构造一个最小化的 tool_stream 原始事件。"""
+
+    tool_payload: dict[str, object] = {
+        "status": status,
+        "name": name,
+        "tool_use_id": tool_use_id,
+        "started_at": started_at,
+    }
+    if duration_ms is not None:
+        tool_payload["duration_ms"] = duration_ms
+    if input_data is not None:
+        tool_payload["input"] = input_data
+    if output is not None:
+        tool_payload["output"] = output
+    return {
+        "type": "tool_stream",
+        "tool_stream_event": {"data": {"easyharness_tool": tool_payload}},
+    }
+
+
+def _drain_queue(output_queue: "queue.Queue[object]") -> list[object]:
+    """按顺序取出队列中的全部事件。"""
+
+    events: list[object] = []
+    while True:
+        try:
+            events.append(output_queue.get_nowait())
+        except queue.Empty:
+            return events
 
 
 def _has_required_metadata_sections(description: str) -> bool:
@@ -207,6 +250,109 @@ class EasyHarnessToolingTests(unittest.TestCase):
         self.assertEqual(model.top_p, 0.01)
         self.assertIsNone(model.seed)
         self.assertEqual(model.context_window_limit, 900_000)
+
+
+class EasyHarnessRuntimeEventMapperTests(unittest.TestCase):
+    """验证 EasyHarness runtime 的 tool 生命周期聚合不会串线。"""
+
+    def test_overlapping_same_name_tool_calls_keep_distinct_public_ids(self) -> None:
+        """同名工具交错 started/completed 时，第一条调用也必须按原 id 收口。"""
+
+        output_queue: "queue.Queue[object]" = queue.Queue()
+        mapper = _EventMapper(output_queue)
+
+        mapper.feed(
+            _tool_stream_event(
+                status="started",
+                name="fmp_get_profile",
+                tool_use_id="tool-1",
+                started_at="2026-07-04T00:00:01+00:00",
+                input_data={"symbol": "AAA"},
+            )
+        )
+        mapper.feed(
+            _tool_stream_event(
+                status="started",
+                name="fmp_get_profile",
+                tool_use_id="tool-2",
+                started_at="2026-07-04T00:00:02+00:00",
+                input_data={"symbol": "BBB"},
+            )
+        )
+        mapper.feed(
+            _tool_stream_event(
+                status="completed",
+                name="fmp_get_profile",
+                tool_use_id="tool-1",
+                started_at="2026-07-04T00:00:01+00:00",
+                duration_ms=1200,
+                output={"preview": "tool-1 done"},
+            )
+        )
+        mapper.feed(
+            _tool_stream_event(
+                status="completed",
+                name="fmp_get_profile",
+                tool_use_id="tool-2",
+                started_at="2026-07-04T00:00:02+00:00",
+                duration_ms=2200,
+                output={"preview": "tool-2 done"},
+            )
+        )
+
+        tool_events = [
+            event for event in _drain_queue(output_queue) if getattr(event, "kind", "") == "tool"
+        ]
+
+        self.assertEqual(
+            [event.status for event in tool_events],
+            ["started", "started", "completed", "completed"],
+        )
+        self.assertEqual(
+            [event.data["tool_use_id"] for event in tool_events],
+            ["tool-1", "tool-2", "tool-1", "tool-2"],
+        )
+        self.assertEqual(tool_events[2].text, "tool-1 done")
+        self.assertEqual(tool_events[3].text, "tool-2 done")
+
+    def test_cancelled_result_emits_cancelled_event_for_all_active_tools(self) -> None:
+        """取消时不应只结束最后一条工具调用。"""
+
+        output_queue: "queue.Queue[object]" = queue.Queue()
+        mapper = _EventMapper(output_queue)
+
+        mapper.feed(
+            _tool_stream_event(
+                status="started",
+                name="fmp_get_profile",
+                tool_use_id="tool-1",
+                started_at="2026-07-04T00:00:01+00:00",
+            )
+        )
+        mapper.feed(
+            _tool_stream_event(
+                status="started",
+                name="fmp_get_quote",
+                tool_use_id="tool-2",
+                started_at="2026-07-04T00:00:02+00:00",
+            )
+        )
+
+        mapper._handle_cancelled_result(type("CancelledResult", (), {"message": None})())
+        events = _drain_queue(output_queue)
+        tool_events = [event for event in events if getattr(event, "kind", "") == "tool"]
+        system_events = [event for event in events if getattr(event, "kind", "") == "system"]
+
+        self.assertEqual(
+            [event.status for event in tool_events],
+            ["started", "started", "cancelled", "cancelled"],
+        )
+        self.assertEqual(
+            [event.data["tool_use_id"] for event in tool_events[-2:]],
+            ["tool-1", "tool-2"],
+        )
+        self.assertEqual(len(system_events), 1)
+        self.assertEqual(system_events[0].status, "cancelled")
 
 if __name__ == "__main__":
     unittest.main()
