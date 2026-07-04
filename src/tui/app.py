@@ -11,6 +11,8 @@ from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import threading
+import time
 from typing import Any
 
 from easyharness import AgentEvent
@@ -39,6 +41,14 @@ _THINKING_STYLE = "bold #88ad8f"
 _LOW_EMPHASIS_STYLE = _THINKING_STYLE
 _TOOL_LABEL_STYLE = "bold #a8c1ae"
 _TOOL_TEXT_STYLE = "#d3ded5"
+_THINKING_STATE_KEY = "thinking_state"
+_THINKING_PLACEHOLDER_STATE = "placeholder"
+_THINKING_HISTORY_STATE = "history"
+_THINKING_ANIMATION_FRAME_DURATION_MS = 300
+_THINKING_ANIMATION_FRAMES = ("...", ".", "..")
+_LOCAL_STARTED_MONOTONIC_KEY = "local_started_monotonic"
+_PENDING_TERMINAL_DURATION_KEY = "pending_terminal_duration_ms"
+_TOOL_STARTED_AT_RAW_KEY = "tool_started_at_raw"
 _SUPPORTED_COMMANDS = ("/stop", "/new", "/help")
 _COMMAND_HELP_TEXT = (
     "Available commands: /stop interrupts the active reply, /new starts a new session, /help shows this help."
@@ -170,6 +180,8 @@ class AgentWorkbenchApp(App[None]):
         self._active_by_kind: dict[str, str] = {}
         self._active_tools: dict[str, str] = {}
         self._active_compress_key = ""
+        self._pending_tool_terminal_durations: dict[str, int] = {}
+        self._pending_tool_terminal_lock = threading.Lock()
         self._pending_turns: deque[_PendingTurn] = deque()
         self._active_turn: _PendingTurn | None = None
         self._active_worker: Worker[None] | None = None
@@ -305,6 +317,7 @@ class AgentWorkbenchApp(App[None]):
             for event in self._agent.stream(prompt):
                 if worker.is_cancelled:
                     return
+                self._record_pending_tool_terminal_event(event)
                 self.call_from_thread(self._apply_agent_event_for_turn, turn_id, event)
             if worker.is_cancelled:
                 return
@@ -334,6 +347,7 @@ class AgentWorkbenchApp(App[None]):
             self._apply_system_event(event)
         elif event.kind == "compress":
             self._apply_compress_event(event)
+        self._reconcile_waiting_feedback_after_event()
         self._status_message = self._format_event_status(event)
         self._refresh_view()
 
@@ -347,13 +361,19 @@ class AgentWorkbenchApp(App[None]):
                     body="",
                     status="started",
                     started_at=self._parse_started_at(event.started_at),
-                    metadata={"ephemeral": True, "history": False},
+                    metadata={
+                        "ephemeral": True,
+                        "history": False,
+                        _THINKING_STATE_KEY: _THINKING_PLACEHOLDER_STATE,
+                    },
                 )
+                item = self._get_active_thinking_item()
+                if item is not None:
+                    self._restart_local_running_timer(item)
                 return
             item.status = "started"
-            item.metadata["provisional"] = False
-            item.metadata["ephemeral"] = True
-            item.metadata["history"] = False
+            self._mark_thinking_as_placeholder(item, provisional=False)
+            self._ensure_local_running_timer(item)
             return
         item = self._get_active_thinking_item()
         if item is None:
@@ -363,16 +383,22 @@ class AgentWorkbenchApp(App[None]):
                 body="",
                 status="started",
                 started_at=self._parse_started_at(event.started_at),
-                metadata={"provisional": False, "ephemeral": True, "history": False},
+                metadata={
+                    "provisional": False,
+                    "ephemeral": True,
+                    "history": False,
+                    _THINKING_STATE_KEY: _THINKING_PLACEHOLDER_STATE,
+                },
             )
             self._active_by_kind["thinking"] = key
             item = self._get_item(key)
+            if item is not None:
+                self._restart_local_running_timer(item)
         if item is None:
             return
         thinking_text = (event.text or "").strip()
         if event.status == "delta":
             item.status = "delta"
-            item.metadata["provisional"] = False
             if thinking_text:
                 self._promote_thinking_item_to_history(
                     item,
@@ -380,8 +406,7 @@ class AgentWorkbenchApp(App[None]):
                     append=True,
                 )
             else:
-                item.metadata["ephemeral"] = True
-                item.metadata["history"] = False
+                self._mark_thinking_as_placeholder(item, provisional=False)
             return
         if event.status in {"completed", "failed", "cancelled"}:
             self._sync_running_item_duration(item)
@@ -395,12 +420,15 @@ class AgentWorkbenchApp(App[None]):
             item.duration_ms = max(item.duration_ms, event.duration_ms or 0)
             item.started_at = None
             item.metadata["provisional"] = False
+            self._clear_local_running_timer(item)
             self._active_by_kind.pop("thinking", None)
 
     def _apply_tool_event(self, event: AgentEvent) -> None:
         self._remove_waiting_thinking_items()
         tool_key = self._tool_event_key(event)
         if event.status == "started":
+            metadata = self._event_data_dict(event)
+            metadata[_TOOL_STARTED_AT_RAW_KEY] = str(event.started_at or "").strip()
             self._active_tools[tool_key] = self._append_item(
                 kind="tool",
                 title="",
@@ -408,8 +436,12 @@ class AgentWorkbenchApp(App[None]):
                 name=event.name or "tool",
                 status="started",
                 started_at=self._parse_started_at(event.started_at),
-                metadata=self._event_data_dict(event),
+                metadata=metadata,
             )
+            item = self._get_item(self._active_tools[tool_key])
+            if item is not None:
+                self._restart_local_running_timer(item)
+                self._sync_pending_tool_terminal_snapshot(item)
             return
         item_key = self._resolve_active_tool_item_key(
             tool_key,
@@ -433,9 +465,13 @@ class AgentWorkbenchApp(App[None]):
         item.duration_ms = event.duration_ms or item.duration_ms
         item.started_at = None
         item.metadata.update(self._event_data_dict(event))
+        item.metadata[_TOOL_STARTED_AT_RAW_KEY] = str(event.started_at or "").strip()
+        self._clear_local_running_timer(item)
         output = self._extract_tool_output(event)
         item.preview = output.get("preview") or event.text or item.preview
         item.detail = output.get("detail") or output.get("model_text") or item.detail
+        item.metadata.pop(_PENDING_TERMINAL_DURATION_KEY, None)
+        self._clear_pending_tool_terminal_snapshot(event, item)
         if event.text and not item.preview:
             item.preview = event.text
         if event.status in {"completed", "failed", "cancelled"}:
@@ -540,6 +576,7 @@ class AgentWorkbenchApp(App[None]):
         )
 
     def _apply_compress_event(self, event: AgentEvent) -> None:
+        self._remove_waiting_thinking_items()
         body = self._compress_activity_text(event.status, event.text or "")
         metadata = self._event_data_dict(event)
         if event.status == "failed":
@@ -556,12 +593,16 @@ class AgentWorkbenchApp(App[None]):
                     duration_ms=event.duration_ms or 0,
                     metadata=metadata,
                 )
+                item = self._get_item(self._active_compress_key)
+                if item is not None:
+                    self._restart_local_running_timer(item)
                 return
             item.body = body
             item.status = "started"
             item.started_at = self._parse_started_at(event.started_at)
             item.duration_ms = event.duration_ms or item.duration_ms
             item.metadata.update(metadata)
+            self._restart_local_running_timer(item)
             return
 
         item = self._get_item(self._active_compress_key)
@@ -583,6 +624,7 @@ class AgentWorkbenchApp(App[None]):
         item.started_at = None
         item.duration_ms = event.duration_ms or item.duration_ms
         item.metadata.update(metadata)
+        self._clear_local_running_timer(item)
         if event.status in {"completed", "failed", "cancelled"}:
             self._active_compress_key = ""
 
@@ -681,8 +723,29 @@ class AgentWorkbenchApp(App[None]):
             title="thinking",
             status="started",
             started_at=datetime.now(timezone.utc),
-            metadata={"provisional": True, "ephemeral": True},
+            metadata={
+                "provisional": True,
+                "ephemeral": True,
+                "history": False,
+                _THINKING_STATE_KEY: _THINKING_PLACEHOLDER_STATE,
+            },
         )
+        item = self._get_active_thinking_item()
+        if item is not None:
+            self._restart_local_running_timer(item)
+
+    @staticmethod
+    def _mark_thinking_as_placeholder(
+        item: _TimelineItem,
+        *,
+        provisional: bool,
+    ) -> None:
+        """把 thinking 条目标记为 turn 空窗前置占位符。"""
+
+        item.metadata[_THINKING_STATE_KEY] = _THINKING_PLACEHOLDER_STATE
+        item.metadata["provisional"] = provisional
+        item.metadata["ephemeral"] = True
+        item.metadata["history"] = False
 
     def _promote_thinking_item_to_history(
         self,
@@ -702,6 +765,7 @@ class AgentWorkbenchApp(App[None]):
         item.metadata["ephemeral"] = False
         item.metadata["history"] = True
         item.metadata["provisional"] = False
+        item.metadata[_THINKING_STATE_KEY] = _THINKING_HISTORY_STATE
 
     def _remove_waiting_thinking_items(self) -> None:
         """只移除仍然停留在 waiting-only 状态的 thinking 占位。"""
@@ -741,6 +805,7 @@ class AgentWorkbenchApp(App[None]):
 
         if self._active_turn is not None or not self._pending_turns:
             return
+        self._clear_all_pending_tool_terminal_snapshots()
         turn = self._pending_turns.popleft()
         self._active_turn = turn
         self._stopping_turn_id = None
@@ -757,6 +822,7 @@ class AgentWorkbenchApp(App[None]):
         if self._active_turn is None:
             return
         self._active_worker = None
+        self._clear_all_pending_tool_terminal_snapshots()
         item = self._get_item(self._active_turn.user_item_key)
         if item is not None:
             item.metadata["queue_state"] = queue_state
@@ -796,6 +862,7 @@ class AgentWorkbenchApp(App[None]):
             self._sync_running_item_duration(item)
             item.status = status
             item.started_at = None
+            self._clear_local_running_timer(item)
         self._active_by_kind.clear()
         for key in list(self._active_tools.values()):
             item = self._get_item(key)
@@ -804,6 +871,7 @@ class AgentWorkbenchApp(App[None]):
             self._sync_running_item_duration(item)
             item.status = status
             item.started_at = None
+            self._clear_local_running_timer(item)
             if message and "error" not in item.metadata:
                 item.metadata["error"] = message
         self._active_tools.clear()
@@ -813,6 +881,7 @@ class AgentWorkbenchApp(App[None]):
                 self._sync_running_item_duration(item)
                 item.status = status
                 item.started_at = None
+                self._clear_local_running_timer(item)
             if status in {"completed", "failed", "cancelled"}:
                 self._active_compress_key = ""
 
@@ -892,26 +961,207 @@ class AgentWorkbenchApp(App[None]):
 
         if item.started_at is None:
             return
-        duration_ms = int(
-            (datetime.now(timezone.utc) - item.started_at).total_seconds() * 1000
-        )
+        duration_ms = AgentWorkbenchApp._running_item_duration_ms(item)
         item.duration_ms = max(0, duration_ms)
 
     def _refresh_running_items(self) -> None:
         """刷新仍处于 started 状态的本地展示时长。"""
 
         changed = False
-        now = datetime.now(timezone.utc)
         for item in self._items:
             if item.started_at is None:
                 continue
-            duration_ms = int((now - item.started_at).total_seconds() * 1000)
+            if item.kind == "tool":
+                self._sync_pending_tool_terminal_snapshot(item)
+            duration_ms = self._running_item_duration_ms(item)
             duration_ms = max(0, duration_ms)
             if duration_ms != item.duration_ms:
                 item.duration_ms = duration_ms
                 changed = True
         if changed:
             self._render_timeline()
+
+    @staticmethod
+    def _running_item_duration_ms(item: _TimelineItem) -> int:
+        """优先使用本地单调时钟刷新运行中条目的耗时。"""
+
+        pending_terminal_duration = item.metadata.get(_PENDING_TERMINAL_DURATION_KEY)
+        if isinstance(pending_terminal_duration, int):
+            return pending_terminal_duration
+        local_started = item.metadata.get(_LOCAL_STARTED_MONOTONIC_KEY)
+        if isinstance(local_started, (int, float)):
+            return int((time.perf_counter() - float(local_started)) * 1000)
+        if item.started_at is None:
+            return item.duration_ms
+        return int((datetime.now(timezone.utc) - item.started_at).total_seconds() * 1000)
+
+    @staticmethod
+    def _restart_local_running_timer(item: _TimelineItem) -> None:
+        """为运行中的本地活动项重置单调计时起点。"""
+
+        item.metadata[_LOCAL_STARTED_MONOTONIC_KEY] = time.perf_counter()
+
+    @staticmethod
+    def _ensure_local_running_timer(item: _TimelineItem) -> None:
+        """为运行中的本地活动项补齐单调计时起点。"""
+
+        item.metadata.setdefault(_LOCAL_STARTED_MONOTONIC_KEY, time.perf_counter())
+
+    @staticmethod
+    def _clear_local_running_timer(item: _TimelineItem) -> None:
+        """清理运行态结束后的本地单调计时元数据。"""
+
+        item.metadata.pop(_LOCAL_STARTED_MONOTONIC_KEY, None)
+
+    def _reconcile_waiting_feedback_after_event(self) -> None:
+        """在每次事件应用后统一协调 waiting `Thinking ...` 反馈。"""
+
+        self._restore_waiting_thinking_if_turn_still_active()
+
+    def _restore_waiting_thinking_if_turn_still_active(self) -> None:
+        """在活跃 turn 出现无可见运行态空窗时回补本地 thinking 占位。"""
+
+        if self._active_turn is None:
+            return
+        if self._stopping_turn_id == self._active_turn.turn_id:
+            return
+        if self._cancelled_turn_id == self._active_turn.turn_id:
+            return
+        if self._get_active_thinking_item() is not None:
+            return
+        if self._has_visible_running_activity():
+            return
+        self._start_local_thinking()
+
+    @staticmethod
+    def _is_visible_running_item(item: _TimelineItem | None) -> bool:
+        """判断某个时间线项是否仍表示真实运行中活动。"""
+
+        if item is None:
+            return False
+        if item.status in {"completed", "failed", "cancelled"}:
+            return False
+        if item.started_at is not None:
+            return True
+        if isinstance(item.metadata.get(_LOCAL_STARTED_MONOTONIC_KEY), (int, float)):
+            return True
+        return item.status in {"started", "delta"}
+
+    def _record_pending_tool_terminal_event(self, event: AgentEvent) -> None:
+        """在后台线程先登记 tool 终态耗时，避免主线程延迟时继续跑表。"""
+
+        if event.kind != "tool":
+            return
+        if event.status not in {"completed", "failed", "cancelled"}:
+            return
+        if event.duration_ms is None:
+            return
+        aliases = self._tool_event_aliases(event)
+        if not aliases:
+            return
+        with self._pending_tool_terminal_lock:
+            for alias in aliases:
+                self._pending_tool_terminal_durations[alias] = event.duration_ms
+
+    def _sync_pending_tool_terminal_snapshot(self, item: _TimelineItem) -> None:
+        """把后台已收到的 tool 终态耗时提前同步到本地 running 条目。"""
+
+        if item.kind != "tool":
+            return
+        pending_duration = self._pending_tool_terminal_duration_for_item(item)
+        if pending_duration is None:
+            item.metadata.pop(_PENDING_TERMINAL_DURATION_KEY, None)
+            return
+        item.metadata[_PENDING_TERMINAL_DURATION_KEY] = pending_duration
+
+    def _pending_tool_terminal_duration_for_item(
+        self,
+        item: _TimelineItem,
+    ) -> int | None:
+        """查找某个 tool 条目是否已有待应用的终态耗时。"""
+
+        aliases = self._tool_item_aliases(item)
+        if not aliases:
+            return None
+        with self._pending_tool_terminal_lock:
+            for alias in aliases:
+                pending_duration = self._pending_tool_terminal_durations.get(alias)
+                if pending_duration is not None:
+                    return pending_duration
+        return None
+
+    def _clear_pending_tool_terminal_snapshot(
+        self,
+        event: AgentEvent,
+        item: _TimelineItem | None = None,
+    ) -> None:
+        """在 tool 终态正式应用后清理后台暂存的提前停表快照。"""
+
+        aliases = set(self._tool_event_aliases(event))
+        if item is not None:
+            aliases.update(self._tool_item_aliases(item))
+        if not aliases:
+            return
+        with self._pending_tool_terminal_lock:
+            for alias in aliases:
+                self._pending_tool_terminal_durations.pop(alias, None)
+
+    def _clear_all_pending_tool_terminal_snapshots(self) -> None:
+        """清空当前 turn 残留的 tool 终态提前停表快照。"""
+
+        with self._pending_tool_terminal_lock:
+            self._pending_tool_terminal_durations.clear()
+
+    @staticmethod
+    def _tool_event_aliases(event: AgentEvent) -> tuple[str, ...]:
+        """为一个 tool 事件生成稳定别名集合。"""
+
+        aliases: list[str] = []
+        tool_key = AgentWorkbenchApp._tool_event_key(event)
+        if tool_key:
+            aliases.append(tool_key)
+        data = AgentWorkbenchApp._event_data_dict(event)
+        tool_use_id = str(data.get("tool_use_id", "")).strip()
+        if tool_use_id:
+            aliases.append(tool_use_id)
+        started_at = str(event.started_at or "").strip()
+        if started_at:
+            aliases.append(f"{started_at}|{event.name or 'tool'}")
+        if not aliases and event.name:
+            aliases.append(event.name)
+        return tuple(dict.fromkeys(alias for alias in aliases if alias))
+
+    @staticmethod
+    def _tool_item_aliases(item: _TimelineItem) -> tuple[str, ...]:
+        """为本地 tool 条目生成可用于终态匹配的别名集合。"""
+
+        aliases: list[str] = []
+        tool_use_id = AgentWorkbenchApp._tool_use_id_from_metadata(item.metadata)
+        if tool_use_id:
+            aliases.append(tool_use_id)
+        started_at_raw = str(item.metadata.get(_TOOL_STARTED_AT_RAW_KEY, "")).strip()
+        if started_at_raw:
+            aliases.append(f"{started_at_raw}|{item.name or 'tool'}")
+        if not aliases and item.name:
+            aliases.append(item.name)
+        return tuple(dict.fromkeys(alias for alias in aliases if alias))
+
+    def _has_visible_running_activity(self) -> bool:
+        """判断当前是否仍有真实运行态活动项可见。"""
+
+        for key in set(self._active_by_kind.values()):
+            item = self._get_item(key)
+            if self._is_visible_running_item(item):
+                return True
+        for key in set(self._active_tools.values()):
+            item = self._get_item(key)
+            if self._is_visible_running_item(item):
+                return True
+        if self._active_compress_key:
+            item = self._get_item(self._active_compress_key)
+            if self._is_visible_running_item(item):
+                return True
+        return False
 
     def _handle_slash_command(self, prompt: str) -> bool:
         """在 TUI 内部处理 slash 命令，不把它们送入 agent 队列。"""
@@ -993,6 +1243,7 @@ class AgentWorkbenchApp(App[None]):
             self._sync_running_item_duration(item)
             item.status = "completed"
             item.started_at = None
+            self._clear_local_running_timer(item)
         self._active_by_kind.clear()
         for key in list(self._active_tools.values()):
             item = self._get_item(key)
@@ -1001,6 +1252,7 @@ class AgentWorkbenchApp(App[None]):
             self._sync_running_item_duration(item)
             item.status = "failed"
             item.started_at = None
+            self._clear_local_running_timer(item)
             item.metadata.setdefault("error", "Interrupted")
         self._active_tools.clear()
 
@@ -1232,7 +1484,7 @@ class AgentWorkbenchApp(App[None]):
         message = Text()
         message.append(AgentWorkbenchApp._format_duration(item.duration_ms), style=_TIMING_STYLE)
         message.append(" · ", style=_TIMING_STYLE)
-        message.append("Thinking ...", style=_THINKING_STYLE)
+        message.append(AgentWorkbenchApp._thinking_indicator_text(item), style=_THINKING_STYLE)
         return message
 
     @staticmethod
@@ -1273,8 +1525,20 @@ class AgentWorkbenchApp(App[None]):
         if item.kind == "thinking":
             if not self._is_waiting_thinking_item(item):
                 return self._format_assistant_item(item)
-            return f"{self._format_duration(item.duration_ms)} · Thinking ..."
+            return (
+                f"{self._format_duration(item.duration_ms)} · "
+                f"{self._thinking_indicator_text(item)}"
+            )
         return self._format_tool_item(item)
+
+    @staticmethod
+    def _thinking_indicator_text(item: _TimelineItem) -> str:
+        """返回运行中 thinking 指示器当前应显示的动画帧。"""
+
+        frame_index = (
+            max(item.duration_ms, 0) // _THINKING_ANIMATION_FRAME_DURATION_MS
+        ) % len(_THINKING_ANIMATION_FRAMES)
+        return f"Thinking {_THINKING_ANIMATION_FRAMES[int(frame_index)]}"
 
     def _format_message_item(self, item: _TimelineItem) -> str:
         if item.kind == "user":
@@ -1440,13 +1704,23 @@ class AgentWorkbenchApp(App[None]):
     def _is_waiting_thinking_item(item: _TimelineItem) -> bool:
         """判断 thinking 条目是否仍是可删除的 waiting-only 占位。"""
 
-        return item.kind == "thinking" and item.metadata.get("ephemeral", False)
+        if item.kind != "thinking":
+            return False
+        state = str(item.metadata.get(_THINKING_STATE_KEY, "")).strip()
+        if state:
+            return state == _THINKING_PLACEHOLDER_STATE
+        return item.metadata.get("ephemeral", False)
 
     @staticmethod
     def _is_thinking_history_item(item: _TimelineItem) -> bool:
         """判断 thinking 条目是否已经升级为真实历史消息。"""
 
-        return item.kind == "thinking" and item.metadata.get("history", False)
+        if item.kind != "thinking":
+            return False
+        state = str(item.metadata.get(_THINKING_STATE_KEY, "")).strip()
+        if state:
+            return state == _THINKING_HISTORY_STATE
+        return item.metadata.get("history", False)
 
     @staticmethod
     def _should_hide_timeline_item(item: _TimelineItem) -> bool:

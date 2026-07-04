@@ -176,6 +176,6 @@ def build_default_agent(workspace_root: str | None = None) -> Agent:
         tools=build_default_tools(workspace_root),
         enable_fileglide=False,
         conversation_manager=EventingSummarizingConversationManager(
-            preserve_recent_messages=6,
+            preserve_recent_messages=0,
         ),
     )

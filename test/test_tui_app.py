@@ -20,7 +20,11 @@ from textual.widgets import Input, Static
 from src.tui.app import (
     AgentWorkbenchApp,
     _CHAT_PREFIX_STYLE,
+    _LOCAL_STARTED_MONOTONIC_KEY,
     _LOW_EMPHASIS_STYLE,
+    _PENDING_TERMINAL_DURATION_KEY,
+    _PendingTurn,
+    _THINKING_ANIMATION_FRAME_DURATION_MS,
     _THINKING_HISTORY_BODY_STYLE,
     _THINKING_HISTORY_PREFIX_STYLE,
     _TIMING_STYLE,
@@ -368,9 +372,9 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.35)
             final_text = app._render_timeline_text()
 
-        self.assertIn("Thinking ...", waiting_text)
+        self.assertRegex(waiting_text, r"Thinking \.{1,3}")
         self.assertIn("Assistant > 收到", final_text)
-        self.assertNotIn("Thinking ...", final_text)
+        self.assertNotRegex(final_text, r"Thinking \.{1,3}")
 
     async def test_agent_event_follows_bottom_when_user_is_near_bottom(self) -> None:
         """用户靠近底部时，新事件到来仍应自动跟随到底部。"""
@@ -524,7 +528,26 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         text = app._render_timeline_text()
 
-        self.assertIn("0.80s · Thinking ...", text)
+        self.assertRegex(text, r"0\.80s · Thinking \.{1,3}")
+
+    def test_running_thinking_indicator_animates_dots(self) -> None:
+        """运行中的 thinking 指示器应随刷新节拍切换省略号帧。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        app._apply_agent_event(_started_event("thinking"))
+        thinking_entry = app._items[-1]
+
+        thinking_entry.duration_ms = 0
+        first_text = app._render_timeline_text()
+        thinking_entry.duration_ms = _THINKING_ANIMATION_FRAME_DURATION_MS
+        second_text = app._render_timeline_text()
+        thinking_entry.duration_ms = _THINKING_ANIMATION_FRAME_DURATION_MS * 2
+        third_text = app._render_timeline_text()
+
+        self.assertRegex(first_text, r"Thinking \.{1,3}")
+        self.assertRegex(second_text, r"Thinking \.{1,3}")
+        self.assertRegex(third_text, r"Thinking \.{1,3}")
+        self.assertEqual(len({first_text, second_text, third_text}), 3)
 
     def test_running_thinking_entry_uses_utc_started_at_for_timer(self) -> None:
         """UTC started_at 不应被当成本地时间，避免计时跳到数小时。"""
@@ -561,6 +584,31 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(thinking_items[0].metadata.get("provisional", False))
         self.assertTrue(thinking_items[0].metadata.get("ephemeral", False))
 
+    def test_completed_thinking_restores_waiting_thinking_for_active_turn(self) -> None:
+        """thinking 终态后若 turn 仍活跃，应立即回补 waiting thinking。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        user_key = app._append_user_message(
+            "继续处理",
+            metadata={"turn_id": "turn-1", "queue_state": "running", "queue_position": 0},
+        )
+        app._active_turn = _PendingTurn(turn_id="turn-1", prompt="继续处理", user_item_key=user_key)
+        app._start_local_thinking()
+
+        app._apply_agent_event(_started_event("thinking"))
+        app._apply_agent_event(
+            AgentEvent(kind="thinking", status="completed", text="Reviewing the filing.")
+        )
+
+        restored_item = app._get_active_thinking_item()
+        text = app._render_timeline_text()
+
+        self.assertIsNotNone(restored_item)
+        self.assertIn("Assistant (Thinking) > Reviewing the filing.", text)
+        self.assertRegex(text, r"Thinking \.{1,3}")
+        self.assertTrue(restored_item.metadata.get("provisional", False))
+        self.assertTrue(restored_item.metadata.get("ephemeral", False))
+
     def test_tool_event_removes_waiting_only_placeholder(self) -> None:
         """在 assistant 真正输出前，非 assistant 事件不应移除本地 thinking。"""
 
@@ -572,9 +620,199 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
 
         text = app._render_timeline_text()
 
-        self.assertNotIn("Thinking ...", text)
+        self.assertNotRegex(text, r"Thinking \.{1,3}")
         self.assertIn("Tool fileglide_read_text · Running", text)
         self.assertNotIn("{ Tool", text)
+
+    def test_completed_tool_restores_waiting_placeholder_for_active_turn(self) -> None:
+        """tool 终态后若 turn 仍活跃且没有下一真实动作，应回补 thinking 占位。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        user_key = app._append_user_message(
+            "继续处理",
+            metadata={"turn_id": "turn-1", "queue_state": "running", "queue_position": 0},
+        )
+        app._active_turn = _PendingTurn(turn_id="turn-1", prompt="继续处理", user_item_key=user_key)
+        app._start_local_thinking()
+
+        app._apply_agent_event(_started_event("tool", name="fileglide_read_text"))
+        app._apply_agent_event(
+            AgentEvent(
+                kind="tool",
+                status="completed",
+                name="fileglide_read_text",
+                duration_ms=12,
+                data={
+                    "tool_use_id": "tool-1",
+                    "output": {"preview": "fileglide_read_text: prospectus.md"},
+                },
+            )
+        )
+
+        restored_item = app._get_active_thinking_item()
+        text = app._render_timeline_text()
+
+        self.assertIsNotNone(restored_item)
+        self.assertIn("Tool fileglide_read_text · Done", text)
+        self.assertRegex(text, r"Thinking \.{1,3}")
+
+    def test_assistant_event_removes_waiting_only_placeholder(self) -> None:
+        """真实 assistant 活动到来时应立即接管 waiting thinking。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        app._start_local_thinking()
+
+        app._apply_agent_event(_started_event("assistant"))
+
+        self.assertIsNone(app._get_active_thinking_item())
+        self.assertNotRegex(app._render_timeline_text(), r"Thinking \.{1,3}")
+        self.assertEqual(len([item for item in app._items if item.kind == "assistant"]), 1)
+
+    def test_compress_started_event_removes_waiting_only_placeholder(self) -> None:
+        """真实 compress 活动到来时应立即接管 waiting thinking。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        app._start_local_thinking()
+
+        app._apply_agent_event(AgentEvent(kind="compress", status="started", duration_ms=0))
+
+        self.assertIsNone(app._get_active_thinking_item())
+        self.assertNotRegex(app._render_timeline_text(), r"Thinking \.{1,3}")
+        self.assertEqual(len([item for item in app._items if item.kind == "compress"]), 1)
+
+    def test_running_tool_items_use_independent_local_timers(self) -> None:
+        """并发运行中的 tool 行应基于各自的本地单调时钟刷新。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        shared_started_at = datetime.now(timezone.utc).isoformat()
+        app._apply_agent_event(
+            AgentEvent(
+                kind="tool",
+                status="started",
+                name="fmp_get_profile",
+                started_at=shared_started_at,
+                data={"tool_use_id": "tool-1"},
+            )
+        )
+        app._apply_agent_event(
+            AgentEvent(
+                kind="tool",
+                status="started",
+                name="fmp_get_quote",
+                started_at=shared_started_at,
+                data={"tool_use_id": "tool-2"},
+            )
+        )
+
+        tool_items = [item for item in app._items if item.kind == "tool"]
+        base = time.perf_counter()
+        tool_items[0].metadata[_LOCAL_STARTED_MONOTONIC_KEY] = base - 1.6
+        tool_items[1].metadata[_LOCAL_STARTED_MONOTONIC_KEY] = base - 0.4
+
+        app._refresh_running_items()
+
+        self.assertGreater(tool_items[0].duration_ms, 1200)
+        self.assertLess(tool_items[1].duration_ms, 900)
+        self.assertGreater(tool_items[0].duration_ms, tool_items[1].duration_ms + 500)
+
+    def test_completed_tool_freezes_to_terminal_duration_after_local_refresh(self) -> None:
+        """tool 终态应停止本地刷新并冻结为权威最终耗时。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        started_at = datetime.now(timezone.utc).isoformat()
+        app._apply_agent_event(
+            AgentEvent(
+                kind="tool",
+                status="started",
+                name="fmp_get_profile",
+                started_at=started_at,
+                data={"tool_use_id": "tool-1"},
+            )
+        )
+
+        tool_item = [item for item in app._items if item.kind == "tool"][-1]
+        tool_item.metadata[_LOCAL_STARTED_MONOTONIC_KEY] = time.perf_counter() - 1.8
+        app._refresh_running_items()
+        self.assertGreater(tool_item.duration_ms, 1000)
+
+        app._apply_agent_event(
+            AgentEvent(
+                kind="tool",
+                status="completed",
+                name="fmp_get_profile",
+                started_at=started_at,
+                duration_ms=123,
+                data={
+                    "tool_use_id": "tool-1",
+                    "output": {"preview": "done"},
+                },
+            )
+        )
+
+        self.assertEqual(tool_item.duration_ms, 123)
+        self.assertIsNone(tool_item.started_at)
+        self.assertNotIn(_LOCAL_STARTED_MONOTONIC_KEY, tool_item.metadata)
+        self.assertNotIn(_PENDING_TERMINAL_DURATION_KEY, tool_item.metadata)
+
+    def test_pending_terminal_tool_event_freezes_running_timer_before_ui_applies_event(self) -> None:
+        """后台已收到 tool 终态时，主线程尚未应用前也不应继续累计本地计时。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        started_at = datetime.now(timezone.utc).isoformat()
+        app._apply_agent_event(
+            AgentEvent(
+                kind="tool",
+                status="started",
+                name="fmp_get_profile",
+                started_at=started_at,
+                data={"tool_use_id": "tool-1"},
+            )
+        )
+
+        tool_item = [item for item in app._items if item.kind == "tool"][-1]
+        tool_item.metadata[_LOCAL_STARTED_MONOTONIC_KEY] = time.perf_counter() - 3.5
+
+        pending_terminal = AgentEvent(
+            kind="tool",
+            status="completed",
+            name="fmp_get_profile",
+            started_at=started_at,
+            duration_ms=123,
+            data={"tool_use_id": "tool-1"},
+        )
+        app._record_pending_tool_terminal_event(pending_terminal)
+
+        app._refresh_running_items()
+        frozen_duration = tool_item.duration_ms
+        time.sleep(0.05)
+        app._refresh_running_items()
+
+        self.assertEqual(frozen_duration, 123)
+        self.assertEqual(tool_item.duration_ms, 123)
+        self.assertEqual(
+            tool_item.metadata.get(_PENDING_TERMINAL_DURATION_KEY),
+            123,
+        )
+        self.assertEqual(tool_item.status, "started")
+
+        app._apply_agent_event(
+            AgentEvent(
+                kind="tool",
+                status="completed",
+                name="fmp_get_profile",
+                started_at=started_at,
+                duration_ms=123,
+                data={
+                    "tool_use_id": "tool-1",
+                    "output": {"preview": "done"},
+                },
+            )
+        )
+
+        self.assertEqual(tool_item.duration_ms, 123)
+        self.assertEqual(tool_item.status, "completed")
+        self.assertIsNone(tool_item.started_at)
+        self.assertNotIn(_PENDING_TERMINAL_DURATION_KEY, tool_item.metadata)
 
     def test_tool_renderable_uses_secondary_styles_without_braces(self) -> None:
         """tool 主行应使用次级样式层级，且不再包含花括号。"""
@@ -686,7 +924,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         text = app._render_timeline_text()
 
         self.assertIn("Assistant (Thinking) > Reviewing the filing.", text)
-        self.assertNotIn("Thinking ...", text)
+        self.assertNotRegex(text, r"Thinking \.{1,3}")
         self.assertFalse(thinking_item.metadata.get("ephemeral", True))
         self.assertTrue(thinking_item.metadata.get("history", False))
         self.assertEqual(thinking_item.body, "Reviewing the filing.")
@@ -710,6 +948,51 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         assistant_index = text.index("Assistant > Final answer.")
 
         self.assertLess(thinking_index, assistant_index)
+
+    def test_completed_assistant_restores_waiting_thinking_for_active_turn(self) -> None:
+        """assistant 终态后若 turn 仍活跃，应立即回补 waiting thinking。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        user_key = app._append_user_message(
+            "继续处理",
+            metadata={"turn_id": "turn-1", "queue_state": "running", "queue_position": 0},
+        )
+        app._active_turn = _PendingTurn(turn_id="turn-1", prompt="继续处理", user_item_key=user_key)
+
+        app._apply_agent_event(_started_event("assistant"))
+        app._apply_agent_event(
+            AgentEvent(kind="assistant", status="completed", text="Final answer.")
+        )
+
+        restored_item = app._get_active_thinking_item()
+        text = app._render_timeline_text()
+
+        self.assertIsNotNone(restored_item)
+        self.assertIn("Assistant > Final answer.", text)
+        self.assertRegex(text, r"Thinking \.{1,3}")
+        self.assertTrue(restored_item.metadata.get("provisional", False))
+        self.assertTrue(restored_item.metadata.get("ephemeral", False))
+
+    def test_system_event_restores_waiting_thinking_for_active_turn(self) -> None:
+        """system 事件插入后若 turn 仍活跃，应保持 waiting thinking 可见。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        user_key = app._append_user_message(
+            "继续处理",
+            metadata={"turn_id": "turn-1", "queue_state": "running", "queue_position": 0},
+        )
+        app._active_turn = _PendingTurn(turn_id="turn-1", prompt="继续处理", user_item_key=user_key)
+
+        app._apply_agent_event(AgentEvent(kind="system", status="delta", text="Still working."))
+
+        restored_item = app._get_active_thinking_item()
+        text = app._render_timeline_text()
+
+        self.assertIsNotNone(restored_item)
+        self.assertIn("SmartIPO · Still working.", text)
+        self.assertRegex(text, r"Thinking \.{1,3}")
+        self.assertTrue(restored_item.metadata.get("provisional", False))
+        self.assertTrue(restored_item.metadata.get("ephemeral", False))
 
     def test_thinking_history_renderable_uses_darker_styles(self) -> None:
         """真实 thinking 历史应使用专属暗色前缀和正文样式。"""
@@ -776,6 +1059,51 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Compressing context...", text)
         self.assertNotIn("SmartIPO · Compressing context...", text)
         self.assertNotIn("SmartIPO · Conversation compressed", text)
+
+    def test_completed_compress_restores_waiting_thinking_for_active_turn(self) -> None:
+        """compression 结束后若 turn 仍活跃，应立即恢复本地 thinking 占位。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        user_key = app._append_user_message(
+            "继续处理",
+            metadata={"turn_id": "turn-1", "queue_state": "running", "queue_position": 0},
+        )
+        app._active_turn = _PendingTurn(turn_id="turn-1", prompt="继续处理", user_item_key=user_key)
+        app._start_local_thinking()
+
+        app._apply_agent_event(AgentEvent(kind="compress", status="started", duration_ms=0))
+        self.assertNotRegex(app._render_timeline_text(), r"Thinking \.{1,3}")
+
+        app._apply_agent_event(AgentEvent(kind="compress", status="completed", duration_ms=12))
+
+        restored_item = app._get_active_thinking_item()
+        self.assertIsNotNone(restored_item)
+        self.assertRegex(app._render_timeline_text(), r"Thinking \.{1,3}")
+        self.assertTrue(restored_item.metadata.get("provisional", False))
+        self.assertTrue(restored_item.metadata.get("ephemeral", False))
+
+    def test_real_thinking_started_reuses_restored_waiting_thinking_after_compress(self) -> None:
+        """compression 后回补的 waiting thinking 应被真实 thinking started 复用。"""
+
+        app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
+        user_key = app._append_user_message(
+            "继续处理",
+            metadata={"turn_id": "turn-1", "queue_state": "running", "queue_position": 0},
+        )
+        app._active_turn = _PendingTurn(turn_id="turn-1", prompt="继续处理", user_item_key=user_key)
+        app._start_local_thinking()
+        app._apply_agent_event(AgentEvent(kind="compress", status="started", duration_ms=0))
+        app._apply_agent_event(AgentEvent(kind="compress", status="completed", duration_ms=12))
+
+        restored_item = app._get_active_thinking_item()
+        self.assertIsNotNone(restored_item)
+
+        app._apply_agent_event(_started_event("thinking"))
+
+        thinking_items = [item for item in app._items if item.kind == "thinking"]
+        self.assertEqual(len(thinking_items), 1)
+        self.assertIs(thinking_items[0], restored_item)
+        self.assertFalse(restored_item.metadata.get("provisional", False))
 
     def test_compress_renderable_uses_timing_and_low_emphasis_styles(self) -> None:
         """compress 行应复用计时前缀和低强调正文样式。"""
