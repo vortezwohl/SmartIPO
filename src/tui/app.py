@@ -57,7 +57,6 @@ _PENDING_TEXT_TERMINAL_STATUS_KEY = "pending_text_terminal_status"
 _PENDING_TEXT_TERMINAL_DURATION_KEY = "pending_text_terminal_duration_ms"
 _LOCAL_STARTED_MONOTONIC_KEY = "local_started_monotonic"
 _PENDING_TERMINAL_DURATION_KEY = "pending_terminal_duration_ms"
-_TOOL_STARTED_AT_RAW_KEY = "tool_started_at_raw"
 _SUPPORTED_COMMANDS = ("/stop", "/new", "/help")
 _COMMAND_HELP_TEXT = (
     "Available commands: /stop interrupts the active reply, /new starts a new session, /help shows this help."
@@ -479,8 +478,7 @@ class AgentWorkbenchApp(App[None]):
         tool_key = self._tool_event_key(event)
         if event.status == "started":
             metadata = self._event_data_dict(event)
-            metadata[_TOOL_STARTED_AT_RAW_KEY] = str(event.started_at or "").strip()
-            self._active_tools[tool_key] = self._append_item(
+            item_key = self._append_item(
                 kind="tool",
                 title="",
                 body="",
@@ -489,16 +487,14 @@ class AgentWorkbenchApp(App[None]):
                 started_at=self._parse_started_at(event.started_at),
                 metadata=metadata,
             )
-            item = self._get_item(self._active_tools[tool_key])
+            if tool_key:
+                self._active_tools[tool_key] = item_key
+            item = self._get_item(item_key)
             if item is not None:
                 self._restart_local_running_timer(item)
                 self._sync_pending_tool_terminal_snapshot(item)
             return
-        item_key = self._resolve_active_tool_item_key(
-            tool_key,
-            event.name or "",
-            event.started_at,
-        )
+        item_key = self._active_tools.get(tool_key, "") if tool_key else ""
         item = self._get_item(item_key)
         if item is None:
             key = self._append_item(
@@ -516,7 +512,6 @@ class AgentWorkbenchApp(App[None]):
         item.duration_ms = event.duration_ms or item.duration_ms
         item.started_at = None
         item.metadata.update(self._event_data_dict(event))
-        item.metadata[_TOOL_STARTED_AT_RAW_KEY] = str(event.started_at or "").strip()
         self._clear_local_running_timer(item)
         output = self._extract_tool_output(event)
         item.preview = output.get("preview") or event.text or item.preview
@@ -527,43 +522,6 @@ class AgentWorkbenchApp(App[None]):
             item.preview = event.text
         if event.status in {"completed", "failed", "cancelled"}:
             self._discard_active_tool_item_aliases(item.key)
-
-    def _resolve_active_tool_item_key(
-        self,
-        tool_key: str,
-        tool_name: str,
-        started_at: str | None,
-    ) -> str:
-        """尽量把 tool 终态重新挂回已有运行项，避免同一次调用被渲染成两条。"""
-
-        item_key = self._active_tools.get(tool_key, "")
-        if item_key:
-            return item_key
-        running_item_key = self._find_running_tool_item_key(
-            tool_name=tool_name,
-            started_at=started_at,
-        )
-        if running_item_key and tool_key:
-            self._active_tools[tool_key] = running_item_key
-        return running_item_key
-
-    def _find_running_tool_item_key(self, *, tool_name: str, started_at: str | None) -> str:
-        """按 started_at 或工具名回绑仍在运行的旧工具项。"""
-
-        parsed_started_at = self._parse_started_at(started_at) if started_at else None
-        if parsed_started_at is not None:
-            for item in self._items:
-                if item.kind != "tool" or item.started_at is None:
-                    continue
-                if item.started_at == parsed_started_at:
-                    return item.key
-        if tool_name:
-            for item in self._items:
-                if item.kind != "tool" or item.started_at is None:
-                    continue
-                if item.name == tool_name:
-                    return item.key
-        return ""
 
     def _discard_active_tool_item_aliases(self, item_key: str) -> None:
         """移除一个工具项在活跃映射中的全部别名。"""
@@ -1362,35 +1320,19 @@ class AgentWorkbenchApp(App[None]):
     def _tool_event_aliases(event: AgentEvent) -> tuple[str, ...]:
         """为一个 tool 事件生成稳定别名集合。"""
 
-        aliases: list[str] = []
         tool_key = AgentWorkbenchApp._tool_event_key(event)
-        if tool_key:
-            aliases.append(tool_key)
-        data = AgentWorkbenchApp._event_data_dict(event)
-        tool_use_id = str(data.get("tool_use_id", "")).strip()
-        if tool_use_id:
-            aliases.append(tool_use_id)
-        started_at = str(event.started_at or "").strip()
-        if started_at:
-            aliases.append(f"{started_at}|{event.name or 'tool'}")
-        if not aliases and event.name:
-            aliases.append(event.name)
-        return tuple(dict.fromkeys(alias for alias in aliases if alias))
+        if not tool_key:
+            return ()
+        return (tool_key,)
 
     @staticmethod
     def _tool_item_aliases(item: _TimelineItem) -> tuple[str, ...]:
         """为本地 tool 条目生成可用于终态匹配的别名集合。"""
 
-        aliases: list[str] = []
         tool_use_id = AgentWorkbenchApp._tool_use_id_from_metadata(item.metadata)
-        if tool_use_id:
-            aliases.append(tool_use_id)
-        started_at_raw = str(item.metadata.get(_TOOL_STARTED_AT_RAW_KEY, "")).strip()
-        if started_at_raw:
-            aliases.append(f"{started_at_raw}|{item.name or 'tool'}")
-        if not aliases and item.name:
-            aliases.append(item.name)
-        return tuple(dict.fromkeys(alias for alias in aliases if alias))
+        if not tool_use_id:
+            return ()
+        return (tool_use_id,)
 
     def _has_visible_running_activity(self) -> bool:
         """判断当前是否仍有真实运行态活动项可见。"""
@@ -1870,13 +1812,7 @@ class AgentWorkbenchApp(App[None]):
     @staticmethod
     def _tool_event_key(event: AgentEvent) -> str:
         data = AgentWorkbenchApp._event_data_dict(event)
-        tool_use_id = str(data.get("tool_use_id", "")).strip()
-        if tool_use_id:
-            return tool_use_id
-        started_at = str(event.started_at or "").strip()
-        if started_at:
-            return f"{started_at}|{event.name or 'tool'}"
-        return event.name or "tool"
+        return str(data.get("tool_use_id", "")).strip()
 
     @staticmethod
     def _tool_use_id_from_metadata(metadata: dict[str, Any]) -> str:

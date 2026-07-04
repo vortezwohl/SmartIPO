@@ -758,7 +758,14 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         app._start_local_thinking()
 
         time.sleep(0.02)
-        app._apply_agent_event(_started_event("tool", name="fileglide_read_text"))
+        app._apply_agent_event(
+            AgentEvent(
+                kind="tool",
+                status="started",
+                name="fileglide_read_text",
+                data={"tool_use_id": "tool-1"},
+            )
+        )
 
         text = app._render_timeline_text()
 
@@ -777,7 +784,14 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         app._active_turn = _PendingTurn(turn_id="turn-1", prompt="继续处理", user_item_key=user_key)
         app._start_local_thinking()
 
-        app._apply_agent_event(_started_event("tool", name="fileglide_read_text"))
+        app._apply_agent_event(
+            AgentEvent(
+                kind="tool",
+                status="started",
+                name="fileglide_read_text",
+                data={"tool_use_id": "tool-1"},
+            )
+        )
         app._apply_agent_event(
             AgentEvent(
                 kind="tool",
@@ -983,8 +997,8 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("{", tool_renderable.plain)
         self.assertNotIn("}", tool_renderable.plain)
 
-    def test_same_name_tool_calls_rebind_by_started_at_without_leaking_running_item(self) -> None:
-        """同名工具在首选键漂移时也应按 started_at 收口到原始活动项。"""
+    def test_same_name_tool_calls_bind_by_tool_use_id_without_running_leak(self) -> None:
+        """同名工具应仅按 tool_use_id 精确收口，避免串到别的运行项。"""
 
         app = AgentWorkbenchApp(agent=_FakeStreamingAgent([]))
         first_started_at = "2026-07-04T00:00:01+00:00"
@@ -996,6 +1010,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
                 status="started",
                 name="fmp_get_profile",
                 started_at=first_started_at,
+                data={"tool_use_id": "tool-1"},
             )
         )
         app._apply_agent_event(
@@ -1004,6 +1019,7 @@ class AgentWorkbenchAppTests(unittest.IsolatedAsyncioTestCase):
                 status="started",
                 name="fmp_get_profile",
                 started_at=second_started_at,
+                data={"tool_use_id": "tool-2"},
             )
         )
         app._apply_agent_event(
